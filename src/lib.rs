@@ -11,7 +11,9 @@ pub mod supervisor;
 
 pub use client::KvClient;
 pub use dispatch::{
-    dispatch_forward_pass, wrap_input_tokens_as_arrow, ForwardPassRequest, ForwardPassResult,
+    dispatch_forward_pass, wrap_input_tokens_as_arrow, wrap_logits_as_float32_array,
+    ForwardPassRequest, ForwardPassResult,
 };
 pub use error::ManagerError;
 pub use supervisor::{find_worker_binary, ManagedWorker, WorkerPlacement, WorkerSupervisor};
+
