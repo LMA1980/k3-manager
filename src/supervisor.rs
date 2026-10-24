@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -204,12 +205,9 @@ impl ManagedWorker {
 
     /// Checks if the worker process is currently running and healthy.
     pub fn is_alive(&mut self) -> bool {
-        if !self.is_alive {
-            return false;
-        }
         if let Some(child) = &mut self.child {
             match child.try_wait() {
-                Ok(None) => true,
+                Ok(None) => self.is_alive,
                 Ok(Some(_status)) => {
                     self.is_alive = false;
                     false
@@ -229,7 +227,7 @@ impl ManagedWorker {
     /// # Errors
     /// Returns [`ManagerError::WorkerIpc`] if sending signal fails.
     pub fn kill(&mut self, signal: libc::c_int) -> Result<(), ManagerError> {
-        if let Some(child) = &self.child {
+        if let Some(child) = &mut self.child {
             let pid = child.id();
             // SAFETY: kill sends standard signal to supervised child pid.
             let ret = unsafe { libc::kill(pid as libc::pid_t, signal) };
@@ -242,6 +240,15 @@ impl ManagedWorker {
             self.is_alive = false;
             // Close stream immediately to mirror socket termination
             self.stream = None;
+
+            // Wait briefly for kernel to deliver signal and record exit status
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(200) {
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             Ok(())
         } else {
             Err(ManagerError::WorkerIpc("worker child process is not running".to_owned()))
@@ -316,12 +323,30 @@ impl ManagedWorker {
     /// # Errors
     /// Returns [`ManagerError`] on failure.
     pub fn shutdown(&mut self, graceful: bool) -> Result<(), ManagerError> {
-        if let Some(stream) = &self.stream {
-            let cmd = IpcMessage::ShutdownCommand(k3_core::ipc::protocol::ShutdownCommand { graceful });
-            let _ = send_msg_frame(stream, &cmd, None);
+        if graceful {
+            if let Some(stream) = &self.stream {
+                let cmd = IpcMessage::ShutdownCommand(k3_core::ipc::protocol::ShutdownCommand { graceful: true });
+                let _ = send_msg_frame(stream, &cmd, None);
+            }
         }
         self.stream = None;
         if let Some(mut child) = self.child.take() {
+            if graceful {
+                let start = Instant::now();
+                let mut exited = false;
+                while start.elapsed() < Duration::from_millis(500) {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        exited = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !exited {
+                    let _ = child.kill();
+                }
+            } else {
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
         self.is_alive = false;
@@ -337,6 +362,17 @@ impl ManagedWorker {
         &mut self,
         req: &ForwardPassRequest,
     ) -> Result<ForwardPassResult, ManagerError> {
+        if !self.is_alive() {
+            let status = self.child.as_mut().and_then(|c| c.try_wait().ok().flatten());
+            let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
+            let signal = status.as_ref().and_then(ExitStatusExt::signal);
+            return Err(ManagerError::WorkerCrashed {
+                model_id: self.placement.model_id.clone(),
+                exit_code,
+                signal,
+            });
+        }
+
         let stream = self
             .stream
             .as_ref()
@@ -344,13 +380,15 @@ impl ManagedWorker {
 
         let res = dispatch_forward_pass(stream, &mut self.arena, req);
         if res.is_err() {
-            // Check if process crashed
+            // Check if process crashed mid-pass
             if !self.is_alive() {
                 let status = self.child.as_mut().and_then(|c| c.try_wait().ok().flatten());
+                let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
+                let signal = status.as_ref().and_then(ExitStatusExt::signal);
                 return Err(ManagerError::WorkerCrashed {
                     model_id: self.placement.model_id.clone(),
-                    exit_code: status.and_then(|s| s.code()),
-                    signal: None,
+                    exit_code,
+                    signal,
                 });
             }
         }
@@ -510,7 +548,7 @@ fn spawn_and_attach_process(
     }
     cmd.arg("--model-id").arg(&placement.model_id);
 
-    let child = cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         let _ = fs::remove_file(socket_path);
         ManagerError::WorkerSpawn(format!(
             "failed to spawn worker process '{}': {e}",
@@ -518,7 +556,7 @@ fn spawn_and_attach_process(
         ))
     })?;
 
-    // 4. Accept incoming connection from worker with 5-second timeout
+    // 4. Accept incoming connection from worker with 5-second timeout and fast exit detection
     let start_wait = Instant::now();
     let timeout = Duration::from_secs(5);
     let mut stream: Option<UnixStream> = None;
@@ -530,29 +568,52 @@ fn spawn_and_attach_process(
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(20));
+                // Proactively detect premature child exit without waiting full timeout
+                if let Ok(Some(status)) = child.try_wait() {
+                    let _ = fs::remove_file(socket_path);
+                    return Err(ManagerError::WorkerSpawn(format!(
+                        "worker process exited prematurely with status {status}"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
                 let _ = fs::remove_file(socket_path);
                 return Err(ManagerError::WorkerSpawn(format!("accept error: {e}")));
             }
         }
     }
 
-    let stream = stream.ok_or_else(|| {
+    let Some(stream) = stream else {
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = fs::remove_file(socket_path);
-        ManagerError::WorkerSpawn(format!(
+        return Err(ManagerError::WorkerSpawn(format!(
             "worker failed to connect to socket '{}' within timeout",
             socket_path.display()
-        ))
-    })?;
+        )));
+    };
 
-    stream.set_nonblocking(false).map_err(|e| {
-        ManagerError::WorkerSpawn(format!("failed to set stream blocking: {e}"))
-    })?;
+    if let Err(e) = stream.set_nonblocking(false) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(socket_path);
+        return Err(ManagerError::WorkerSpawn(format!("failed to set stream blocking: {e}")));
+    }
 
     // 5. Transfer shared-memory arena FD via SCM_RIGHTS (AttachArenaCommand / Type ID 201)
-    let arena_fd = arena.duplicate_fd()?;
+    let arena_fd = match arena.duplicate_fd() {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(socket_path);
+            return Err(ManagerError::Shm(e));
+        }
+    };
+
     let attach_cmd = IpcMessage::AttachArenaCommand(AttachArenaCommand {
         arena_id,
         arena_bytes: arena_bytes as u64,
@@ -560,16 +621,32 @@ fn spawn_and_attach_process(
         max_blocks,
     });
 
-    send_msg_frame(&stream, &attach_cmd, Some(arena_fd.as_raw_fd())).map_err(|e| {
-        ManagerError::WorkerIpc(format!("failed to send AttachArenaCommand via SCM_RIGHTS: {e}"))
-    })?;
+    if let Err(e) = send_msg_frame(&stream, &attach_cmd, Some(arena_fd.as_raw_fd())) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(socket_path);
+        return Err(ManagerError::WorkerIpc(format!(
+            "failed to send AttachArenaCommand via SCM_RIGHTS: {e}"
+        )));
+    }
 
     // 6. Await confirmation frame from worker (Type ID 206 with StatusCode::Success)
-    let (header, payload, _) = recv_frame(stream.as_raw_fd()).map_err(|e| {
-        ManagerError::WorkerIpc(format!("failed to receive AttachArena response: {e}"))
-    })?;
+    let (header, payload, _) = match recv_frame(stream.as_raw_fd()) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(socket_path);
+            return Err(ManagerError::WorkerIpc(format!(
+                "failed to receive AttachArena response: {e}"
+            )));
+        }
+    };
 
     if header.type_id != 206 {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(socket_path);
         return Err(ManagerError::Protocol(format!(
             "expected AttachArena response type 206, got {}",
             header.type_id
@@ -580,6 +657,9 @@ fn spawn_and_attach_process(
         let status_code = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let status = StatusCode::from_u32(status_code);
         if !status.is_success() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(socket_path);
             return Err(ManagerError::Status {
                 status,
                 message: format!("AttachArena returned failure status: {status:?}"),
@@ -642,6 +722,11 @@ impl WorkerSupervisor {
         n_ctx: u32,
         max_blocks: u32,
     ) -> Result<&mut ManagedWorker, ManagerError> {
+        // If a worker with this model_id already exists, cleanly tear it down first
+        if let Some(mut existing) = self.workers.remove(&placement.model_id) {
+            let _ = existing.shutdown(false);
+        }
+
         let (child, stream) = spawn_and_attach_process(
             &placement,
             &arena,
@@ -719,8 +804,13 @@ impl WorkerSupervisor {
             .get_mut(model_id)
             .ok_or_else(|| ManagerError::ModelNotFound(model_id.to_owned()))?;
 
-        // 1. Cleanly reap failed process
-        let _ = worker.reap();
+        // 1. Cleanly ensure previous child process is reaped/terminated
+        if let Some(mut child) = worker.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        worker.is_alive = false;
+        worker.stream = None;
 
         // 2. Spawn replacement worker and re-attach surviving arena via SCM_RIGHTS
         let (child, stream) = spawn_and_attach_process(
