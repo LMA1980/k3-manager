@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 
 use k3_core::ipc::layout::{ArenaHeader, KvBlockMeta, KvBlockTag};
 use k3_core::ipc::protocol::{
-    recv_frame, recv_msg_frame, send_msg_frame, AttachArenaCommand, IpcMessage, StatusCode,
-    WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    AttachArenaCommand, IpcMessage, StatusCode, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    recv_frame, recv_msg_frame, send_msg_frame,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
 
-use crate::dispatch::{dispatch_forward_pass, ForwardPassRequest, ForwardPassResult};
+use crate::dispatch::{ForwardPassRequest, ForwardPassResult, dispatch_forward_pass};
 use crate::error::ManagerError;
 
 /// Locates the `k3-worker` binary across environment variables, target outputs, and PATH.
@@ -251,7 +251,9 @@ impl ManagedWorker {
             }
             Ok(())
         } else {
-            Err(ManagerError::WorkerIpc("worker child process is not running".to_owned()))
+            Err(ManagerError::WorkerIpc(
+                "worker child process is not running".to_owned(),
+            ))
         }
     }
 
@@ -284,7 +286,9 @@ impl ManagedWorker {
             self.stream = None;
             Ok(status)
         } else {
-            Err(ManagerError::WorkerIpc("no child process to wait on".to_owned()))
+            Err(ManagerError::WorkerIpc(
+                "no child process to wait on".to_owned(),
+            ))
         }
     }
 
@@ -298,9 +302,7 @@ impl ManagedWorker {
             .as_ref()
             .ok_or_else(|| ManagerError::WorkerIpc("worker stream is closed".to_owned()))?;
 
-        let req = IpcMessage::WorkerHeartbeatRequest(WorkerHeartbeatRequest {
-            timestamp_ns: 1,
-        });
+        let req = IpcMessage::WorkerHeartbeatRequest(WorkerHeartbeatRequest { timestamp_ns: 1 });
 
         send_msg_frame(stream, &req, None).map_err(|e| {
             ManagerError::WorkerIpc(format!("failed to send WorkerHeartbeatRequest: {e}"))
@@ -325,7 +327,9 @@ impl ManagedWorker {
     pub fn shutdown(&mut self, graceful: bool) -> Result<(), ManagerError> {
         if graceful {
             if let Some(stream) = &self.stream {
-                let cmd = IpcMessage::ShutdownCommand(k3_core::ipc::protocol::ShutdownCommand { graceful: true });
+                let cmd = IpcMessage::ShutdownCommand(k3_core::ipc::protocol::ShutdownCommand {
+                    graceful: true,
+                });
                 let _ = send_msg_frame(stream, &cmd, None);
             }
         }
@@ -363,7 +367,10 @@ impl ManagedWorker {
         req: &ForwardPassRequest,
     ) -> Result<ForwardPassResult, ManagerError> {
         if !self.is_alive() {
-            let status = self.child.as_mut().and_then(|c| c.try_wait().ok().flatten());
+            let status = self
+                .child
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten());
             let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
             let signal = status.as_ref().and_then(ExitStatusExt::signal);
             return Err(ManagerError::WorkerCrashed {
@@ -382,7 +389,10 @@ impl ManagedWorker {
         if res.is_err() {
             // Check if process crashed mid-pass
             if !self.is_alive() {
-                let status = self.child.as_mut().and_then(|c| c.try_wait().ok().flatten());
+                let status = self
+                    .child
+                    .as_mut()
+                    .and_then(|c| c.try_wait().ok().flatten());
                 let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
                 let signal = status.as_ref().and_then(ExitStatusExt::signal);
                 return Err(ManagerError::WorkerCrashed {
@@ -412,11 +422,7 @@ impl ManagedWorker {
     ///
     /// # Errors
     /// Returns [`ManagerError`] on bounds check failure.
-    pub fn set_block_tag(
-        &mut self,
-        block_idx: usize,
-        tag: KvBlockTag,
-    ) -> Result<(), ManagerError> {
+    pub fn set_block_tag(&mut self, block_idx: usize, tag: KvBlockTag) -> Result<(), ManagerError> {
         let block = self.arena.block_meta_mut(block_idx)?;
         block.set_tag(tag);
         Ok(())
@@ -600,7 +606,9 @@ fn spawn_and_attach_process(
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_file(socket_path);
-        return Err(ManagerError::WorkerSpawn(format!("failed to set stream blocking: {e}")));
+        return Err(ManagerError::WorkerSpawn(format!(
+            "failed to set stream blocking: {e}"
+        )));
     }
 
     // 5. Transfer shared-memory arena FD via SCM_RIGHTS (AttachArenaCommand / Type ID 201)
@@ -727,14 +735,8 @@ impl WorkerSupervisor {
             let _ = existing.shutdown(false);
         }
 
-        let (child, stream) = spawn_and_attach_process(
-            &placement,
-            &arena,
-            arena_id,
-            arena_bytes,
-            n_ctx,
-            max_blocks,
-        )?;
+        let (child, stream) =
+            spawn_and_attach_process(&placement, &arena, arena_id, arena_bytes, n_ctx, max_blocks)?;
 
         let model_id = placement.model_id.clone();
         let worker = ManagedWorker {
@@ -782,7 +784,10 @@ impl WorkerSupervisor {
     ///
     /// # Errors
     /// Returns [`ManagerError`] on failure.
-    pub fn reap_worker(&mut self, model_id: &str) -> Result<Option<std::process::ExitStatus>, ManagerError> {
+    pub fn reap_worker(
+        &mut self,
+        model_id: &str,
+    ) -> Result<Option<std::process::ExitStatus>, ManagerError> {
         let worker = self
             .workers
             .get_mut(model_id)

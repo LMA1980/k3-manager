@@ -11,11 +11,10 @@ use std::sync::Arc;
 use arrow_array::{Float32Array, UInt32Array};
 use k3_core::ipc::arrow::{wrap_floats_as_float32_array, wrap_tokens_as_uint32_array};
 use k3_core::ipc::layout::{
-    OutputSlabHeader, TokenInputSlotHeader, SLAB_STATUS_IDLE, SLAB_STATUS_READ,
-    SLAB_STATUS_WRITTEN,
+    OutputSlabHeader, SLAB_STATUS_IDLE, SLAB_STATUS_READ, SLAB_STATUS_WRITTEN, TokenInputSlotHeader,
 };
 use k3_core::ipc::protocol::{
-    recv_msg_frame, send_msg_frame, ForwardPassCommand, ForwardPassCompleted, IpcMessage,
+    ForwardPassCommand, ForwardPassCompleted, IpcMessage, recv_msg_frame, send_msg_frame,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
 use zerocopy::FromBytes;
@@ -131,9 +130,8 @@ pub fn dispatch_forward_pass(
 
     // 1. Read header geometry and validate context length bounds
     let hdr = *arena.header()?;
-    let req_tokens_len = u32::try_from(req.tokens.len()).map_err(|_| {
-        ManagerError::Protocol("token count exceeds u32".to_owned())
-    })?;
+    let req_tokens_len = u32::try_from(req.tokens.len())
+        .map_err(|_| ManagerError::Protocol("token count exceeds u32".to_owned()))?;
 
     if req.start_position.saturating_add(req_tokens_len) > hdr.n_ctx {
         return Err(ManagerError::Protocol(format!(
@@ -142,15 +140,13 @@ pub fn dispatch_forward_pass(
         )));
     }
 
-    let slot_offset = usize::try_from(hdr.token_slots_offset).map_err(|e| {
-        ManagerError::Protocol(format!("invalid token_slots_offset: {e}"))
-    })?;
+    let slot_offset = usize::try_from(hdr.token_slots_offset)
+        .map_err(|e| ManagerError::Protocol(format!("invalid token_slots_offset: {e}")))?;
 
     // 2. Write TokenInputSlotHeader (16 bytes) into shared memory
     let slot_hdr_slice = arena.slice_mut(slot_offset, 16)?;
-    let slot_hdr = TokenInputSlotHeader::mut_from_bytes(slot_hdr_slice).map_err(|e| {
-        ManagerError::Protocol(format!("failed to cast TokenInputSlotHeader: {e}"))
-    })?;
+    let slot_hdr = TokenInputSlotHeader::mut_from_bytes(slot_hdr_slice)
+        .map_err(|e| ManagerError::Protocol(format!("failed to cast TokenInputSlotHeader: {e}")))?;
     slot_hdr.slot_seq_id = req.sequence_id;
     slot_hdr.token_len = req_tokens_len;
     slot_hdr.start_position = req.start_position;
@@ -163,13 +159,11 @@ pub fn dispatch_forward_pass(
     }
 
     // 4. Mark output slab as IDLE prior to pass execution
-    let slab_offset = usize::try_from(hdr.output_slabs_offset).map_err(|e| {
-        ManagerError::Protocol(format!("invalid output_slabs_offset: {e}"))
-    })?;
+    let slab_offset = usize::try_from(hdr.output_slabs_offset)
+        .map_err(|e| ManagerError::Protocol(format!("invalid output_slabs_offset: {e}")))?;
     let slab_hdr_slice = arena.slice_mut(slab_offset, 64)?;
-    let slab_hdr = OutputSlabHeader::mut_from_bytes(slab_hdr_slice).map_err(|e| {
-        ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}"))
-    })?;
+    let slab_hdr = OutputSlabHeader::mut_from_bytes(slab_hdr_slice)
+        .map_err(|e| ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}")))?;
     slab_hdr.status = SLAB_STATUS_IDLE;
 
     // 5. Send compact ForwardPassCommand descriptor over UDS (zero tensor bytes over socket)
@@ -188,7 +182,9 @@ pub fn dispatch_forward_pass(
 
     // 6. Receive ForwardPassCompleted from worker
     let (reply, _) = recv_msg_frame(stream).map_err(|e| {
-        ManagerError::WorkerIpc(format!("failed to receive ForwardPassCompleted from worker: {e}"))
+        ManagerError::WorkerIpc(format!(
+            "failed to receive ForwardPassCompleted from worker: {e}"
+        ))
     })?;
 
     let completed = match reply {
@@ -196,9 +192,9 @@ pub fn dispatch_forward_pass(
             if !c.status.is_success() {
                 return Err(ManagerError::Status {
                     status: c.status,
-                    message: c
-                        .error_message
-                        .unwrap_or_else(|| format!("forward pass failed with status {:?}", c.status)),
+                    message: c.error_message.unwrap_or_else(|| {
+                        format!("forward pass failed with status {:?}", c.status)
+                    }),
                 });
             }
             if c.request_id != req.request_id {
@@ -218,9 +214,8 @@ pub fn dispatch_forward_pass(
 
     // 7. Verify slab status is WRITTEN and wrap output logits into zero-copy Apache Arrow Float32Array
     let slab_slice = arena.slice(slab_offset, 64)?;
-    let slab_hdr = OutputSlabHeader::ref_from_bytes(slab_slice).map_err(|e| {
-        ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}"))
-    })?;
+    let slab_hdr = OutputSlabHeader::ref_from_bytes(slab_slice)
+        .map_err(|e| ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}")))?;
 
     if slab_hdr.status != SLAB_STATUS_WRITTEN {
         return Err(ManagerError::Protocol(format!(
@@ -249,14 +244,12 @@ pub fn wrap_logits_as_float32_array(
     arena: &SharedMemoryArena,
 ) -> Result<Float32Array, ManagerError> {
     let hdr = *arena.header()?;
-    let slab_offset = usize::try_from(hdr.output_slabs_offset).map_err(|e| {
-        ManagerError::Protocol(format!("invalid output_slabs_offset: {e}"))
-    })?;
+    let slab_offset = usize::try_from(hdr.output_slabs_offset)
+        .map_err(|e| ManagerError::Protocol(format!("invalid output_slabs_offset: {e}")))?;
 
     let slab_slice = arena.slice(slab_offset, 64)?;
-    let slab_hdr = OutputSlabHeader::ref_from_bytes(slab_slice).map_err(|e| {
-        ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}"))
-    })?;
+    let slab_hdr = OutputSlabHeader::ref_from_bytes(slab_slice)
+        .map_err(|e| ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}")))?;
 
     let vocab_size = if slab_hdr.vocab_size > 0 {
         slab_hdr.vocab_size as usize
@@ -287,18 +280,14 @@ pub fn wrap_logits_as_float32_array(
 /// # Errors
 /// Returns [`ManagerError`] on bounds or layout failure.
 #[allow(clippy::cast_ptr_alignment)]
-pub fn wrap_input_tokens_as_arrow(
-    arena: &SharedMemoryArena,
-) -> Result<UInt32Array, ManagerError> {
+pub fn wrap_input_tokens_as_arrow(arena: &SharedMemoryArena) -> Result<UInt32Array, ManagerError> {
     let hdr = *arena.header()?;
-    let slot_offset = usize::try_from(hdr.token_slots_offset).map_err(|e| {
-        ManagerError::Protocol(format!("invalid token_slots_offset: {e}"))
-    })?;
+    let slot_offset = usize::try_from(hdr.token_slots_offset)
+        .map_err(|e| ManagerError::Protocol(format!("invalid token_slots_offset: {e}")))?;
 
     let slot_hdr_slice = arena.slice(slot_offset, 16)?;
-    let slot_hdr = TokenInputSlotHeader::ref_from_bytes(slot_hdr_slice).map_err(|e| {
-        ManagerError::Protocol(format!("failed to cast TokenInputSlotHeader: {e}"))
-    })?;
+    let slot_hdr = TokenInputSlotHeader::ref_from_bytes(slot_hdr_slice)
+        .map_err(|e| ManagerError::Protocol(format!("failed to cast TokenInputSlotHeader: {e}")))?;
     let token_count = slot_hdr.token_len as usize;
 
     let tokens_data_offset = slot_offset + 16;

@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use k3_core::ipc::protocol::{
-    recv_msg_frame, send_msg_frame, AllocateArenaRequest, AllocateArenaResponse,
-    DeallocateArenaRequest, DeallocateArenaResponse, GetArenaFdRequest, GetArenaFdResponse,
-    IpcMessage, PingRequest, PingResponse,
+    AllocateArenaRequest, AllocateArenaResponse, DeallocateArenaRequest, DeallocateArenaResponse,
+    GetArenaFdRequest, GetArenaFdResponse, IpcMessage, PingRequest, PingResponse, recv_msg_frame,
+    send_msg_frame,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
 
@@ -72,9 +72,8 @@ impl KvClient {
             timestamp_ns: now_ns,
         });
 
-        send_msg_frame(&self.stream, &req, None).map_err(|e| {
-            ManagerError::Kv(format!("failed to send PingRequest to k3-kv: {e}"))
-        })?;
+        send_msg_frame(&self.stream, &req, None)
+            .map_err(|e| ManagerError::Kv(format!("failed to send PingRequest to k3-kv: {e}")))?;
 
         let (reply, _) = recv_msg_frame(&self.stream).map_err(|e| {
             ManagerError::Kv(format!("failed to receive PingResponse from k3-kv: {e}"))
@@ -119,7 +118,9 @@ impl KvClient {
         })?;
 
         let (reply, _) = recv_msg_frame(&self.stream).map_err(|e| {
-            ManagerError::Kv(format!("failed to receive AllocateArenaResponse from k3-kv: {e}"))
+            ManagerError::Kv(format!(
+                "failed to receive AllocateArenaResponse from k3-kv: {e}"
+            ))
         })?;
 
         match reply {
@@ -129,9 +130,9 @@ impl KvClient {
                 } else {
                     Err(ManagerError::Status {
                         status: resp.status,
-                        message: resp
-                            .error_message
-                            .unwrap_or_else(|| format!("AllocateArena failed with status {:?}", resp.status)),
+                        message: resp.error_message.unwrap_or_else(|| {
+                            format!("AllocateArena failed with status {:?}", resp.status)
+                        }),
                     })
                 }
             }
@@ -156,7 +157,9 @@ impl KvClient {
         })?;
 
         let (reply, opt_fd) = recv_msg_frame(&self.stream).map_err(|e| {
-            ManagerError::Kv(format!("failed to receive GetArenaFdResponse from k3-kv: {e}"))
+            ManagerError::Kv(format!(
+                "failed to receive GetArenaFdResponse from k3-kv: {e}"
+            ))
         })?;
 
         match reply {
@@ -164,9 +167,9 @@ impl KvClient {
                 if !resp.status.is_success() {
                     return Err(ManagerError::Status {
                         status: resp.status,
-                        message: resp
-                            .error_message
-                            .unwrap_or_else(|| format!("GetArenaFd failed with status {:?}", resp.status)),
+                        message: resp.error_message.unwrap_or_else(|| {
+                            format!("GetArenaFd failed with status {:?}", resp.status)
+                        }),
                     });
                 }
                 let fd = opt_fd.ok_or_else(|| {
@@ -235,11 +238,15 @@ impl KvClient {
         let req = IpcMessage::DeallocateArenaRequest(DeallocateArenaRequest { arena_id });
 
         send_msg_frame(&self.stream, &req, None).map_err(|e| {
-            ManagerError::Kv(format!("failed to send DeallocateArenaRequest to k3-kv: {e}"))
+            ManagerError::Kv(format!(
+                "failed to send DeallocateArenaRequest to k3-kv: {e}"
+            ))
         })?;
 
         let (reply, _) = recv_msg_frame(&self.stream).map_err(|e| {
-            ManagerError::Kv(format!("failed to receive DeallocateArenaResponse from k3-kv: {e}"))
+            ManagerError::Kv(format!(
+                "failed to receive DeallocateArenaResponse from k3-kv: {e}"
+            ))
         })?;
 
         match reply {
@@ -249,9 +256,9 @@ impl KvClient {
                 } else {
                     Err(ManagerError::Status {
                         status: resp.status,
-                        message: resp
-                            .error_message
-                            .unwrap_or_else(|| format!("DeallocateArena failed with status {:?}", resp.status)),
+                        message: resp.error_message.unwrap_or_else(|| {
+                            format!("DeallocateArena failed with status {:?}", resp.status)
+                        }),
                     })
                 }
             }

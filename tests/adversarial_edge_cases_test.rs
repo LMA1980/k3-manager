@@ -26,7 +26,7 @@ use k3_core::ipc::layout::{OutputSlabHeader, SLAB_STATUS_IDLE, SLAB_STATUS_WRITT
 use k3_kv::server::{KvServer, ServerConfig};
 use k3_manager::client::KvClient;
 use k3_manager::dispatch::{
-    dispatch_forward_pass, wrap_logits_as_float32_array, ForwardPassRequest,
+    ForwardPassRequest, dispatch_forward_pass, wrap_logits_as_float32_array,
 };
 use k3_manager::error::ManagerError;
 use k3_manager::supervisor::{WorkerPlacement, WorkerSupervisor};
@@ -81,7 +81,8 @@ fn test_adversarial_worker_premature_exit_fast_detection() {
         .expect("alloc arena");
 
     // Point placement to a nonexistent weights file so k3-worker exits immediately with exit 12
-    let non_existent_weights = std::env::temp_dir().join("definitely_nonexistent_weights_12345.gguf");
+    let non_existent_weights =
+        std::env::temp_dir().join("definitely_nonexistent_weights_12345.gguf");
     let worker_sock = unique_socket_path("k3_worker_adv_pre");
     let placement = WorkerPlacement::new("adv_model", &non_existent_weights, &worker_sock, "x100");
 
@@ -113,7 +114,10 @@ fn test_adversarial_worker_premature_exit_fast_detection() {
     );
 
     // Verify socket file was cleaned up
-    assert!(!worker_sock.exists(), "socket file should be cleaned up on failure");
+    assert!(
+        !worker_sock.exists(),
+        "socket file should be cleaned up on failure"
+    );
 
     kv_task.abort();
     let _ = std::fs::remove_file(&kv_sock);
@@ -273,7 +277,10 @@ fn test_adversarial_signal_reporting_and_recover_running_worker() {
     // Verify old process was actually terminated
     // SAFETY: kill 0 checks if process exists
     let old_exists = unsafe { libc::kill(old_pid as libc::pid_t, 0) == 0 };
-    assert!(!old_exists, "old worker process must be terminated and reaped");
+    assert!(
+        !old_exists,
+        "old worker process must be terminated and reaped"
+    );
 
     // 2. Kill new worker with SIGKILL and verify signal extraction
     let worker2 = supervisor.get_worker_mut("adv_sig_model").unwrap();
@@ -346,7 +353,9 @@ fn test_adversarial_unwritten_output_slab_rejection() {
     let (s_mgr, s_mock_worker) = std::os::unix::net::UnixStream::pair().expect("unix pair");
 
     std::thread::spawn(move || {
-        use k3_core::ipc::protocol::{recv_msg_frame, send_msg_frame, ForwardPassCompleted, IpcMessage, StatusCode};
+        use k3_core::ipc::protocol::{
+            ForwardPassCompleted, IpcMessage, StatusCode, recv_msg_frame, send_msg_frame,
+        };
         if let Ok((IpcMessage::ForwardPassCommand(cmd), _)) = recv_msg_frame(&s_mock_worker) {
             // Leave slab IDLE in memory! (mock worker defect)
             let completed = IpcMessage::ForwardPassCompleted(ForwardPassCompleted {

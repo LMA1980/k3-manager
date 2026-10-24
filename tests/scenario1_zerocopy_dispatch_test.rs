@@ -20,10 +20,10 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use k3_core::ipc::layout::{KvBlockTag, ARENA_MAGIC, ARENA_VERSION};
+use k3_core::ipc::layout::{ARENA_MAGIC, ARENA_VERSION, KvBlockTag};
 use k3_kv::server::{KvServer, ServerConfig};
 use k3_manager::client::KvClient;
-use k3_manager::dispatch::{wrap_input_tokens_as_arrow, ForwardPassRequest};
+use k3_manager::dispatch::{ForwardPassRequest, wrap_input_tokens_as_arrow};
 use k3_manager::supervisor::{WorkerPlacement, WorkerSupervisor};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(100);
@@ -109,12 +109,7 @@ fn test_scenario1_zerocopy_forward_pass_orchestration() {
     let weights_path = create_dummy_weights("weights_s1");
     let worker_sock_path = unique_socket_path("k3_worker_s1");
 
-    let placement = WorkerPlacement::new(
-        model_id,
-        &weights_path,
-        &worker_sock_path,
-        "x100",
-    );
+    let placement = WorkerPlacement::new(model_id, &weights_path, &worker_sock_path, "x100");
 
     let mut supervisor = WorkerSupervisor::new();
     let worker = supervisor
@@ -141,12 +136,7 @@ fn test_scenario1_zerocopy_forward_pass_orchestration() {
     // Step 4: Write prompt tokens into shared memory slot (Zero UDS bulk bytes)
     // ------------------------------------------------------------------------
     let prompt_tokens = vec![101_u32, 2054, 2003, 1037, 7000];
-    let prefill_req = ForwardPassRequest::new_prefill(
-        1001,
-        1,
-        prompt_tokens.clone(),
-        vec![0],
-    );
+    let prefill_req = ForwardPassRequest::new_prefill(1001, 1, prompt_tokens.clone(), vec![0]);
     // (Before dispatch, tokens will be written by dispatch_forward_pass)
 
     // ------------------------------------------------------------------------
@@ -165,7 +155,10 @@ fn test_scenario1_zerocopy_forward_pass_orchestration() {
     // Verify arrow input tokens view after write
     let arrow_input_tokens = wrap_input_tokens_as_arrow(worker.arena()).expect("arrow input view");
     assert_eq!(arrow_input_tokens.len(), 5);
-    assert_eq!(arrow_input_tokens.values().as_ref(), prompt_tokens.as_slice());
+    assert_eq!(
+        arrow_input_tokens.values().as_ref(),
+        prompt_tokens.as_slice()
+    );
 
     // ------------------------------------------------------------------------
     // Step 6: Verify output logits exposed as zero-copy Apache Arrow Float32Array
@@ -223,7 +216,9 @@ fn test_scenario1_zerocopy_forward_pass_orchestration() {
     assert!(!worker.is_alive());
 
     // Deallocate arena in k3-kv
-    let dealloc_resp = kv_client.deallocate_arena(arena_id).expect("deallocate arena");
+    let dealloc_resp = kv_client
+        .deallocate_arena(arena_id)
+        .expect("deallocate arena");
     assert!(dealloc_resp.status.is_success());
 
     // Terminate k3-kv server and clean temp files
