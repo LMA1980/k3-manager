@@ -17,3 +17,15 @@ unused_qualifications = "warn"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
+
+[dependencies]
+k3-core.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+fory.workspace = true
+libc.workspace = true
+tokio.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+k3-kv.workspace = true
