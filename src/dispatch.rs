@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use arrow_array::{Float32Array, UInt32Array};
 use k3_core::ipc::arrow::{wrap_floats_as_float32_array, wrap_tokens_as_uint32_array};
-use k3_core::ipc::layout::{OutputSlabHeader, TokenInputSlotHeader, SLAB_STATUS_IDLE};
+use k3_core::ipc::layout::{
+    OutputSlabHeader, TokenInputSlotHeader, SLAB_STATUS_IDLE, SLAB_STATUS_READ,
+    SLAB_STATUS_WRITTEN,
+};
 use k3_core::ipc::protocol::{
     recv_msg_frame, send_msg_frame, ForwardPassCommand, ForwardPassCompleted, IpcMessage,
 };
@@ -126,8 +129,19 @@ pub fn dispatch_forward_pass(
         ));
     }
 
-    // 1. Read header geometry
+    // 1. Read header geometry and validate context length bounds
     let hdr = *arena.header()?;
+    let req_tokens_len = u32::try_from(req.tokens.len()).map_err(|_| {
+        ManagerError::Protocol("token count exceeds u32".to_owned())
+    })?;
+
+    if req.start_position.saturating_add(req_tokens_len) > hdr.n_ctx {
+        return Err(ManagerError::Protocol(format!(
+            "sequence position {} + token count {} exceeds arena n_ctx {}",
+            req.start_position, req_tokens_len, hdr.n_ctx
+        )));
+    }
+
     let slot_offset = usize::try_from(hdr.token_slots_offset).map_err(|e| {
         ManagerError::Protocol(format!("invalid token_slots_offset: {e}"))
     })?;
@@ -138,9 +152,7 @@ pub fn dispatch_forward_pass(
         ManagerError::Protocol(format!("failed to cast TokenInputSlotHeader: {e}"))
     })?;
     slot_hdr.slot_seq_id = req.sequence_id;
-    slot_hdr.token_len = u32::try_from(req.tokens.len()).map_err(|_| {
-        ManagerError::Protocol("token count exceeds u32".to_owned())
-    })?;
+    slot_hdr.token_len = req_tokens_len;
     slot_hdr.start_position = req.start_position;
 
     // 3. Write tokens array in place into shared memory slot
@@ -165,7 +177,7 @@ pub fn dispatch_forward_pass(
         request_id: req.request_id,
         sequence_id: req.sequence_id,
         token_offset: req.start_position,
-        token_count: u32::try_from(req.tokens.len()).unwrap_or(0),
+        token_count: req_tokens_len,
         block_indices: req.block_indices.clone(),
         is_prefill: req.is_prefill,
     });
@@ -204,11 +216,48 @@ pub fn dispatch_forward_pass(
         }
     };
 
-    // 7. Verify slab was written and wrap output logits into zero-copy Apache Arrow Float32Array
+    // 7. Verify slab status is WRITTEN and wrap output logits into zero-copy Apache Arrow Float32Array
     let slab_slice = arena.slice(slab_offset, 64)?;
     let slab_hdr = OutputSlabHeader::ref_from_bytes(slab_slice).map_err(|e| {
         ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}"))
     })?;
+
+    if slab_hdr.status != SLAB_STATUS_WRITTEN {
+        return Err(ManagerError::Protocol(format!(
+            "output slab status is not WRITTEN (observed {})",
+            slab_hdr.status
+        )));
+    }
+
+    let logits = wrap_logits_as_float32_array(arena)?;
+
+    // 8. Mark slab as READ to signal consumer completed inspection (ADR-018, ADR-042)
+    let slab_slice_mut = arena.slice_mut(slab_offset, 64)?;
+    if let Ok(slab_hdr_mut) = OutputSlabHeader::mut_from_bytes(slab_slice_mut) {
+        slab_hdr_mut.status = SLAB_STATUS_READ;
+    }
+
+    Ok(ForwardPassResult { completed, logits })
+}
+
+/// Exposes the output activations/logits in place from `OutputSlabHeader` via Apache Arrow zero-copy [`Float32Array`] view.
+///
+/// # Errors
+/// Returns [`ManagerError`] on bounds, layout, or casting failure.
+#[allow(clippy::cast_ptr_alignment)]
+pub fn wrap_logits_as_float32_array(
+    arena: &SharedMemoryArena,
+) -> Result<Float32Array, ManagerError> {
+    let hdr = *arena.header()?;
+    let slab_offset = usize::try_from(hdr.output_slabs_offset).map_err(|e| {
+        ManagerError::Protocol(format!("invalid output_slabs_offset: {e}"))
+    })?;
+
+    let slab_slice = arena.slice(slab_offset, 64)?;
+    let slab_hdr = OutputSlabHeader::ref_from_bytes(slab_slice).map_err(|e| {
+        ManagerError::Protocol(format!("failed to cast OutputSlabHeader: {e}"))
+    })?;
+
     let vocab_size = if slab_hdr.vocab_size > 0 {
         slab_hdr.vocab_size as usize
     } else if hdr.vocab_size > 0 {
@@ -222,16 +271,15 @@ pub fn dispatch_forward_pass(
 
     let arena_fd_owner = Arc::new(arena.duplicate_fd()?);
     // SAFETY: logits_slice points to vocab_size valid f32 values in memory backed by arena_fd_owner.
-    let logits = unsafe {
+    unsafe {
         wrap_floats_as_float32_array(
             arena_fd_owner,
             "output_logits",
             logits_slice.as_ptr().cast::<f32>(),
             vocab_size,
-        )?
-    };
-
-    Ok(ForwardPassResult { completed, logits })
+        )
+        .map_err(ManagerError::from)
+    }
 }
 
 /// Exposes the input tokens in the shared-memory slot as a zero-copy Apache Arrow [`UInt32Array`].

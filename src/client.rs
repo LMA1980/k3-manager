@@ -211,9 +211,16 @@ impl KvClient {
     ) -> Result<(AllocateArenaResponse, SharedMemoryArena), ManagerError> {
         let alloc_resp = self.allocate_arena(model_id, arena_bytes, n_ctx, max_blocks)?;
         let bytes_len = usize::try_from(alloc_resp.arena_bytes).map_err(|_| {
+            let _ = self.deallocate_arena(alloc_resp.arena_id);
             ManagerError::Kv("allocated arena_bytes exceeds usize".to_owned())
         })?;
-        let arena = self.attach_arena(alloc_resp.arena_id, bytes_len, model_id)?;
+        let arena = match self.attach_arena(alloc_resp.arena_id, bytes_len, model_id) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = self.deallocate_arena(alloc_resp.arena_id);
+                return Err(e);
+            }
+        };
         Ok((alloc_resp, arena))
     }
 
