@@ -115,8 +115,14 @@ fn test_scheduler_stress_cloned_instances_across_32_threads() {
     }
 
     assert_eq!(total_c6 + total_c7, 100_000);
-    assert_eq!(total_c6, 50_000, "Cloned scheduler must share atomic counter");
-    assert_eq!(total_c7, 50_000, "Cloned scheduler must share atomic counter");
+    assert_eq!(
+        total_c6, 50_000,
+        "Cloned scheduler must share atomic counter"
+    );
+    assert_eq!(
+        total_c7, 50_000,
+        "Cloned scheduler must share atomic counter"
+    );
 }
 
 #[test]
@@ -302,8 +308,16 @@ fn test_watchdog_recovery_core_invariants() {
 
     // Watchdog core must not be in active control cores
     let watchdog_core = default_sched.watchdog_recovery_core().unwrap();
-    assert!(!default_sched.capacity().active_control_cores.contains(&watchdog_core));
-    assert_eq!(default_sched.capacity().active_control_mask & (1 << watchdog_core), 0);
+    assert!(
+        !default_sched
+            .capacity()
+            .active_control_cores
+            .contains(&watchdog_core)
+    );
+    assert_eq!(
+        default_sched.capacity().active_control_mask & (1 << watchdog_core),
+        0
+    );
     // Watchdog core must be in X100 cluster mask
     assert_ne!(X100_CLUSTER_MASK & (1 << watchdog_core), 0);
     // Watchdog core must NOT be in A100 cluster mask
@@ -392,7 +406,10 @@ fn test_concurrent_capacity_inspection_under_scheduling_load() {
 
     stop_signal.store(1, Ordering::Relaxed);
     let read_count = reader_handle.join().expect("reader join failed");
-    assert!(read_count > 100, "Reader thread should execute many cycles safely");
+    assert!(
+        read_count > 100,
+        "Reader thread should execute many cycles safely"
+    );
 }
 
 // ============================================================================

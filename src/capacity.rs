@@ -33,7 +33,10 @@ pub trait ResolvedControlCapacityExt {
 impl ResolvedControlCapacityExt for ResolvedControlCapacity {
     fn validate_worker_placement(&self, placement: &WorkerPlacement) -> Result<(), ManagerError> {
         if let Some(ref aff_str) = placement.affinity {
-            let mask = if let Some(hex_str) = aff_str.strip_prefix("0x").or_else(|| aff_str.strip_prefix("0X")) {
+            let mask = if let Some(hex_str) = aff_str
+                .strip_prefix("0x")
+                .or_else(|| aff_str.strip_prefix("0X"))
+            {
                 u64::from_str_radix(hex_str, 16).map_err(|e| {
                     ManagerError::WorkerSpawn(format!("invalid hex affinity '{aff_str}': {e}"))
                 })?
@@ -64,8 +67,7 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
                         requested_threads: mask.count_ones() as usize,
                         reason: format!(
                             "worker placement on '{0}' exceeds X100 compute cap mask 0x{1:04X}",
-                            placement.model_id,
-                            self.x100_compute_cap_mask
+                            placement.model_id, self.x100_compute_cap_mask
                         ),
                     }));
                 }
@@ -111,7 +113,10 @@ impl ControlPlaneScheduler {
     /// # Errors
     ///
     /// Returns [`ManagerError`] if the affinity mask is invalid or violates capacity boundaries.
-    pub fn validate_worker_placement(&self, placement: &WorkerPlacement) -> Result<(), ManagerError> {
+    pub fn validate_worker_placement(
+        &self,
+        placement: &WorkerPlacement,
+    ) -> Result<(), ManagerError> {
         self.capacity.validate_worker_placement(placement)
     }
 }

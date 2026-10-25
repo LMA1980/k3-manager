@@ -48,7 +48,11 @@ fn dummy_placement(model_id: &str, cluster: &str, affinity: Option<&str>) -> Wor
 fn test_empirical_error_routing_affinity_error_to_affinity_variant() {
     let test_cases = [
         (0x00FF_u64, 8_usize, "online core count exhaustion"),
-        (0x00C0_u64, 2_usize, "overlapping dedicated active control cores"),
+        (
+            0x00C0_u64,
+            2_usize,
+            "overlapping dedicated active control cores",
+        ),
         (0x0020_u64, 1_usize, "spare recovery core conflict"),
         (0x0000_u64, 0_usize, "zero active control cores requested"),
         (0xFFFF_u64, 16_usize, "cross-cluster mask bounds exceeded"),
@@ -153,7 +157,9 @@ fn test_empirical_error_routing_non_affinity_variants_to_tensor_bounds() {
                 assert_eq!(inner, &k3_err);
             }
             ManagerError::Affinity(_) => {
-                panic!("non-affinity error incorrectly routed to ManagerError::Affinity: {k3_err:?}");
+                panic!(
+                    "non-affinity error incorrectly routed to ManagerError::Affinity: {k3_err:?}"
+                );
             }
             other => {
                 panic!("expected ManagerError::TensorBounds, got {other:?}");
@@ -507,7 +513,8 @@ fn test_empirical_worker_placement_invalid_affinity_strings_yield_worker_spawn_e
         match res_err.unwrap_err() {
             ManagerError::WorkerSpawn(msg) => {
                 assert!(
-                    msg.contains("invalid hex affinity") || msg.contains("invalid integer affinity"),
+                    msg.contains("invalid hex affinity")
+                        || msg.contains("invalid integer affinity"),
                     "Unexpected WorkerSpawn message for {label}: {msg}"
                 );
             }
