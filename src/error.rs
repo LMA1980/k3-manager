@@ -27,6 +27,8 @@ pub enum ManagerError {
     },
     /// Shared memory arena or `SCM_RIGHTS` transfer error.
     Shm(IpcError),
+    /// Core affinity configuration, topology validation, or reservation error.
+    Affinity(K3Error),
     /// Tensor bounds or layout error.
     TensorBounds(K3Error),
     /// Protocol framing or type error.
@@ -61,6 +63,7 @@ impl fmt::Display for ManagerError {
                 )
             }
             Self::Shm(e) => write!(f, "[k3-manager shm error] {e}"),
+            Self::Affinity(e) => write!(f, "[k3-manager affinity error] {e}"),
             Self::TensorBounds(e) => write!(f, "[k3-manager tensor bounds error] {e}"),
             Self::Protocol(msg) => write!(f, "[k3-manager protocol error] {msg}"),
             Self::Status { status, message } => {
@@ -76,7 +79,7 @@ impl std::error::Error for ManagerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Shm(e) => Some(e),
-            Self::TensorBounds(e) => Some(e),
+            Self::Affinity(e) | Self::TensorBounds(e) => Some(e),
             Self::Io(e) => Some(e),
             _ => None,
         }
@@ -97,6 +100,76 @@ impl From<IpcError> for ManagerError {
 
 impl From<K3Error> for ManagerError {
     fn from(err: K3Error) -> Self {
-        Self::TensorBounds(err)
+        match err {
+            e @ K3Error::AffinityError { .. } => Self::Affinity(e),
+            other => Self::TensorBounds(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn test_from_affinity_error_discriminates_to_affinity_variant() {
+        let k3_err = K3Error::AffinityError {
+            requested_mask: 0x00FF,
+            requested_threads: 8,
+            reason: "control cores cannot exceed available online cores".to_string(),
+        };
+
+        let mgr_err: ManagerError = k3_err.clone().into();
+        match mgr_err {
+            ManagerError::Affinity(ref inner) => {
+                assert_eq!(inner, &k3_err);
+            }
+            other => panic!("expected ManagerError::Affinity, got {other:?}"),
+        }
+
+        let display_str = format!("{mgr_err}");
+        assert!(display_str.contains("[k3-manager affinity error]"));
+        assert!(display_str.contains("[affinity_error]"));
+        assert!(display_str.contains("0x00FF"));
+        assert!(display_str.contains("threads: 8"));
+
+        let source = mgr_err.source().expect("source should be Some");
+        assert_eq!(format!("{source}"), format!("{k3_err}"));
+    }
+
+    #[test]
+    fn test_from_tensor_bounds_error_discriminates_to_tensor_bounds_variant() {
+        let k3_err = K3Error::TensorBoundsError {
+            tensor_name: "weight".to_string(),
+            offset: 0,
+            byte_len: 128,
+            buffer_len: 64,
+            reason: "exceeds buffer".to_string(),
+        };
+
+        let mgr_err: ManagerError = k3_err.clone().into();
+        match mgr_err {
+            ManagerError::TensorBounds(ref inner) => {
+                assert_eq!(inner, &k3_err);
+            }
+            other => panic!("expected ManagerError::TensorBounds, got {other:?}"),
+        }
+
+        let display_str = format!("{mgr_err}");
+        assert!(display_str.contains("[k3-manager tensor bounds error]"));
+        assert!(display_str.contains("[tensor_bounds_error]"));
+
+        let source = mgr_err.source().expect("source should be Some");
+        assert_eq!(format!("{source}"), format!("{k3_err}"));
+    }
+
+    #[test]
+    fn test_source_implementation_for_other_variants() {
+        let io_err = ManagerError::Io(io::Error::new(io::ErrorKind::NotFound, "file not found"));
+        assert!(io_err.source().is_some());
+
+        let proto_err = ManagerError::Protocol("invalid frame".to_string());
+        assert!(proto_err.source().is_none());
     }
 }
