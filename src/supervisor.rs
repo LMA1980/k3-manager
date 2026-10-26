@@ -26,7 +26,7 @@ use k3_core::ipc::shm::SharedMemoryArena;
 use crate::dispatch::{ForwardPassRequest, ForwardPassResult, dispatch_forward_pass};
 use crate::domain::{
     CgroupV2DomainController, IsolationDomainController, PlacementOutcome,
-    resolve_worker_compute_mask,
+    resolve_worker_compute_mask, validate_model_id,
 };
 use crate::error::ManagerError;
 
@@ -788,7 +788,8 @@ impl WorkerSupervisor {
         n_ctx: u32,
         max_blocks: u32,
     ) -> Result<&mut ManagedWorker, ManagerError> {
-        // Resolve compute mask before spawning process to catch configuration errors early
+        // Validate model identifier and resolve compute mask before spawning process
+        validate_model_id(&placement.model_id)?;
         let compute_mask = resolve_worker_compute_mask(&placement)?;
 
         // If a worker with this model_id already exists, cleanly tear it down first
@@ -895,6 +896,7 @@ impl WorkerSupervisor {
         worker.is_alive = false;
         worker.stream = None;
 
+        validate_model_id(&worker.placement.model_id)?;
         let compute_mask = resolve_worker_compute_mask(&worker.placement)?;
 
         // 2. Spawn replacement worker and re-attach surviving arena via SCM_RIGHTS

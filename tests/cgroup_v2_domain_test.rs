@@ -465,3 +465,216 @@ fn test_worker_supervisor_place_control_plane_helper() {
         Some("6060\n")
     );
 }
+
+#[test]
+fn test_model_id_validation_rejects_empty_and_traversal() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/mock/cgroup")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    let invalid_models = &[
+        "",
+        "   ",
+        ".",
+        "..",
+        "../control",
+        "../../etc/passwd",
+        "org/model",
+        "nested\\dir",
+        "model\0null",
+    ];
+
+    for &bad_model in invalid_models {
+        let err = controller
+            .place_worker(1001, bad_model, 0x003F)
+            .expect_err(&format!("expected error for bad model_id '{bad_model}'"));
+        assert!(
+            matches!(err, ManagerError::WorkerSpawn(_)),
+            "expected WorkerSpawn error for '{bad_model}', got {err:?}"
+        );
+    }
+
+    // Verify /mock/cgroup/control was not created or modified by traversal attempts
+    assert!(!fs.is_dir_created("/mock/cgroup/control"));
+    assert_eq!(fs.written_file("/mock/cgroup/control/cgroup.procs"), None);
+    assert_eq!(aff.calls().len(), 0);
+}
+
+#[test]
+fn test_place_worker_rejects_worker_pid_zero() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/mock/cgroup")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    let err = controller
+        .place_worker(0, "qwen2.5-7b", 0x003F)
+        .expect_err("worker pid 0 must be rejected");
+
+    assert!(matches!(err, ManagerError::WorkerSpawn(_)));
+    assert_eq!(fs.created_dirs().len(), 0);
+    assert_eq!(aff.calls().len(), 0);
+}
+
+#[test]
+fn test_cgroup_v2_cpuset_write_einval_fallback_to_os_affinity() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/mock/cgroup")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Inject EINVAL (InvalidInput) simulating parent cpuset boundary refusal
+    fs.inject_error(
+        "/mock/cgroup/engines/einval-model/cpuset.cpus",
+        io::ErrorKind::InvalidInput,
+    );
+
+    let outcome = controller
+        .place_worker(7070, "einval-model", 0x003F)
+        .expect("fallback on EINVAL");
+
+    assert!(outcome.mode.is_os_affinity_fallback());
+    assert!(aff.has_called(7070, 0x003F));
+}
+
+#[test]
+fn test_cgroup_v2_include_spare_in_control_option() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+
+    let cap = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("capacity");
+
+    // 1. Controller with include_spare = false -> active only (cores 6-7, "6-7")
+    let ctrl_no_spare = CgroupV2DomainController::new("/mock/no_spare")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone())
+        .with_include_spare(false);
+    assert!(!ctrl_no_spare.include_spare_in_control());
+
+    let outcome_no_spare = ctrl_no_spare
+        .place_control_plane(101, &cap)
+        .expect("no spare placement");
+    assert_eq!(
+        fs.written_file("/mock/no_spare/control/cpuset.cpus")
+            .as_deref(),
+        Some("6-7\n")
+    );
+    match outcome_no_spare.mode {
+        DomainPlacementMode::CgroupV2 { cpuset, .. } => assert_eq!(cpuset, "6-7"),
+        DomainPlacementMode::OsAffinityFallback { .. } => panic!("expected CgroupV2"),
+    }
+
+    // 2. Controller with include_spare = true -> active + spare (cores 5-7, "5-7")
+    let ctrl_with_spare = CgroupV2DomainController::new("/mock/with_spare")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone())
+        .with_include_spare(true);
+    assert!(ctrl_with_spare.include_spare_in_control());
+
+    let outcome_with_spare = ctrl_with_spare
+        .place_control_plane(102, &cap)
+        .expect("with spare placement");
+    assert_eq!(
+        fs.written_file("/mock/with_spare/control/cpuset.cpus")
+            .as_deref(),
+        Some("5-7\n")
+    );
+    match outcome_with_spare.mode {
+        DomainPlacementMode::CgroupV2 { cpuset, .. } => assert_eq!(cpuset, "5-7"),
+        DomainPlacementMode::OsAffinityFallback { .. } => panic!("expected CgroupV2"),
+    }
+}
+
+#[test]
+fn test_cgroup_v2_subtree_control_intermediate_ancestors() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/mock/cgroup")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    let outcome = controller
+        .place_worker(8080, "qwen2.5", 0x003F)
+        .expect("worker placement");
+    assert!(outcome.mode.is_cgroup_v2());
+
+    // Verify intermediate cgroup subtree_control has +cpuset enabled
+    assert_eq!(
+        fs.written_file("/mock/cgroup/engines/cgroup.subtree_control")
+            .as_deref(),
+        Some("+cpuset\n")
+    );
+    assert_eq!(
+        fs.written_file("/mock/cgroup/cgroup.subtree_control")
+            .as_deref(),
+        Some("+cpuset\n")
+    );
+}
+
+#[test]
+fn test_exhaustive_cpuset_roundtrip_all_16bit_masks() {
+    for mask in 1_u64..=0xFFFF {
+        let formatted = format_cpuset_list(mask)
+            .unwrap_or_else(|e| panic!("failed to format 0x{mask:04X}: {e}"));
+        let parsed = parse_cpuset_list(&formatted)
+            .unwrap_or_else(|e| panic!("failed to parse '{formatted}' for 0x{mask:04X}: {e}"));
+        assert_eq!(
+            parsed, mask,
+            "roundtrip mismatch: mask=0x{mask:04X}, formatted='{formatted}', parsed=0x{parsed:04X}"
+        );
+    }
+}
+
+#[test]
+fn test_multi_model_worker_placement_concurrent_supervisors() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = Arc::new(
+        CgroupV2DomainController::new("/mock/cgroup")
+            .with_fs(fs.clone())
+            .with_affinity_backend(aff.clone()),
+    );
+
+    let models_and_masks = [
+        ("model-alpha", 0x0007_u64, 10001_u32),
+        ("model-beta", 0x0038_u64, 10002_u32),
+        ("model-gamma", 0x0F00_u64, 10003_u32),
+        ("model-delta", 0xF000_u64, 10004_u32),
+    ];
+
+    let handles: Vec<_> = models_and_masks
+        .iter()
+        .map(|&(model, mask, pid)| {
+            let ctrl = controller.clone();
+            std::thread::spawn(move || {
+                ctrl.place_worker(pid, model, mask)
+                    .unwrap_or_else(|e| panic!("failed placement for {model}: {e}"))
+            })
+        })
+        .collect();
+
+    for (h, &(model, mask, pid)) in handles.into_iter().zip(models_and_masks.iter()) {
+        let outcome = h.join().expect("thread join");
+        assert_eq!(outcome.target_id, pid);
+        assert!(outcome.mode.is_cgroup_v2());
+
+        let expected_cpuset = format_cpuset_list(mask).unwrap();
+        let cpuset_path = format!("/mock/cgroup/engines/{model}/cpuset.cpus");
+        let procs_path = format!("/mock/cgroup/engines/{model}/cgroup.procs");
+
+        assert_eq!(
+            fs.written_file(&cpuset_path).as_deref(),
+            Some(format!("{expected_cpuset}\n").as_str())
+        );
+        assert_eq!(
+            fs.written_file(&procs_path).as_deref(),
+            Some(format!("{pid}\n").as_str())
+        );
+    }
+}

@@ -224,6 +224,32 @@ pub fn resolve_worker_compute_mask(placement: &WorkerPlacement) -> Result<u64, M
     }
 }
 
+/// Validates that a model identifier is safe for cgroup leaf directory naming.
+///
+/// # Errors
+/// Returns [`ManagerError::WorkerSpawn`] if `model_id` is empty, whitespace-only,
+/// contains path separators (`/`, `\`), control characters, null bytes, or directory traversal (`..`, `.`).
+pub fn validate_model_id(model_id: &str) -> Result<(), ManagerError> {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() {
+        return Err(ManagerError::WorkerSpawn(
+            "model_id cannot be empty".to_string(),
+        ));
+    }
+    if trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('\0')
+    {
+        return Err(ManagerError::WorkerSpawn(format!(
+            "invalid model_id '{model_id}': cannot contain path separators, control characters, or traversal components"
+        )));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Placement Outcome Types
 // ============================================================================
@@ -722,6 +748,23 @@ impl CgroupV2DomainController {
     fn try_cgroup_placement(&self, leaf_dir: &Path, cpuset_str: &str, pid: u32) -> io::Result<()> {
         self.fs.create_dir_all(leaf_dir)?;
 
+        // Enable +cpuset on intermediate cgroup ancestors between base_path and leaf_dir
+        if let Some(parent) = leaf_dir.parent() {
+            let mut curr = parent;
+            while curr.starts_with(&self.base_path) {
+                let subtree_file = curr.join("cgroup.subtree_control");
+                let _ = self.fs.write(&subtree_file, b"+cpuset\n");
+                if curr == self.base_path {
+                    break;
+                }
+                if let Some(p) = curr.parent() {
+                    curr = p;
+                } else {
+                    break;
+                }
+            }
+        }
+
         let cpuset_file = leaf_dir.join("cpuset.cpus");
         self.fs
             .write(&cpuset_file, format!("{cpuset_str}\n").as_bytes())?;
@@ -815,6 +858,12 @@ impl IsolationDomainController for CgroupV2DomainController {
         model_id: &str,
         compute_mask: u64,
     ) -> Result<PlacementOutcome, ManagerError> {
+        validate_model_id(model_id)?;
+        if worker_pid == 0 {
+            return Err(ManagerError::WorkerSpawn(
+                "worker pid cannot be zero".to_string(),
+            ));
+        }
         if compute_mask == 0 {
             return Err(ManagerError::Affinity(K3Error::AffinityError {
                 requested_mask: 0,

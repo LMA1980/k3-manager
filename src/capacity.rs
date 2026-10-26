@@ -22,6 +22,7 @@ pub use crate::domain::{
     CgroupFs, CgroupV2DomainController, DomainPlacementMode, IsolationDomainController,
     MockCgroupFs, MockOsAffinityBackend, OsAffinityBackend, PlacementOutcome, RealCgroupFs,
     RealOsAffinityBackend, format_cpuset_list, parse_cpuset_list, resolve_worker_compute_mask,
+    validate_model_id,
 };
 
 /// Extension trait providing manager-specific placement validation on [`ResolvedControlCapacity`].
