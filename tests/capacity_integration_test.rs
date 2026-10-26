@@ -365,3 +365,60 @@ fn test_worker_placement_thread_validation() {
     assert!(matches!(err, ManagerError::Affinity(_)));
     assert!(format!("{err}").contains("exceeding 2 available cores in affinity mask 0x0003"));
 }
+
+#[test]
+fn test_worker_placement_cross_cluster_mask_rejection() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // X100 worker placement specifying A100 cores (0xFF00)
+    let p_x100_a100_cores =
+        WorkerPlacement::new("m_x100_bad", &weights, &socket, "x100").with_affinity("0xFF00");
+    let err = res
+        .validate_worker_placement(&p_x100_a100_cores)
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    assert!(format!("{err}").contains("specifies cores outside X100 mask 0x00FF"));
+
+    // A100 worker placement specifying X100 cores (0x003F)
+    let p_a100_x100_cores =
+        WorkerPlacement::new("m_a100_bad", &weights, &socket, "a100").with_affinity("0x003F");
+    let err_a100 = res
+        .validate_worker_placement(&p_a100_x100_cores)
+        .unwrap_err();
+    assert!(matches!(err_a100, ManagerError::Affinity(_)));
+    assert!(format!("{err_a100}").contains("specifies cores outside A100 mask 0xFF00"));
+
+    // Unsupported cluster string rejection
+    let p_bad_cluster =
+        WorkerPlacement::new("m_bad_cluster", &weights, &socket, "gpu").with_threads(2);
+    let err_cluster = res.validate_worker_placement(&p_bad_cluster).unwrap_err();
+    assert!(matches!(err_cluster, ManagerError::WorkerSpawn(_)));
+    assert!(format!("{err_cluster}").contains("unsupported cluster 'gpu'"));
+}
+
+#[test]
+fn test_worker_placement_non_contiguous_affinity() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // Non-contiguous affinity mask 0x0005 (cores 0 and 2) with 2 threads -> OK
+    let p_valid_non_contig = WorkerPlacement::new("m_non_contig", &weights, &socket, "x100")
+        .with_affinity("0x0005")
+        .with_threads(2);
+    assert!(res.validate_worker_placement(&p_valid_non_contig).is_ok());
+
+    // Non-contiguous affinity mask 0x0005 with 3 threads -> rejected (3 > 2)
+    let p_excess_threads = WorkerPlacement::new("m_non_contig_excess", &weights, &socket, "x100")
+        .with_affinity("0x0005")
+        .with_threads(3);
+    let err = res
+        .validate_worker_placement(&p_excess_threads)
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    assert!(format!("{err}").contains("exceeding 2 available cores in affinity mask 0x0005"));
+}

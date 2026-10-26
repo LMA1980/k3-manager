@@ -40,6 +40,14 @@ pub trait ResolvedControlCapacityExt {
 impl ResolvedControlCapacityExt for ResolvedControlCapacity {
     #[allow(clippy::too_many_lines)]
     fn validate_worker_placement(&self, placement: &WorkerPlacement) -> Result<(), ManagerError> {
+        let cluster = placement.cluster.to_ascii_lowercase();
+        if cluster != "x100" && cluster != "a100" {
+            return Err(ManagerError::WorkerSpawn(format!(
+                "unsupported cluster '{0}'; must be 'x100' or 'a100'",
+                placement.cluster
+            )));
+        }
+
         // 1. Validate requested thread count bounds upfront
         if let Some(threads) = placement.threads {
             if threads == 0 {
@@ -53,9 +61,7 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
                 }));
             }
 
-            if placement.cluster.eq_ignore_ascii_case("x100")
-                && threads as usize > self.x100_max_compute_cores
-            {
+            if cluster == "x100" && threads as usize > self.x100_max_compute_cores {
                 return Err(ManagerError::Affinity(K3Error::AffinityError {
                     requested_mask: self.x100_compute_cap_mask,
                     requested_threads: threads as usize,
@@ -66,9 +72,7 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
                 }));
             }
 
-            if placement.cluster.eq_ignore_ascii_case("a100")
-                && threads as usize > self.a100_max_compute_cores
-            {
+            if cluster == "a100" && threads as usize > self.a100_max_compute_cores {
                 return Err(ManagerError::Affinity(K3Error::AffinityError {
                     requested_mask: A100_CLUSTER_MASK,
                     requested_threads: threads as usize,
@@ -107,7 +111,7 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
             };
 
             // If placement targets X100, ensure it does not overlap active control cores or exceed compute cap
-            if placement.cluster.eq_ignore_ascii_case("x100") {
+            if cluster == "x100" {
                 if (mask & self.active_control_mask) != 0 {
                     return Err(ManagerError::Affinity(K3Error::AffinityError {
                         requested_mask: mask,
@@ -131,7 +135,18 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
                         ),
                     }));
                 }
-            } else if placement.cluster.eq_ignore_ascii_case("a100") {
+
+                if (mask & !X100_CLUSTER_MASK) != 0 {
+                    return Err(ManagerError::Affinity(K3Error::AffinityError {
+                        requested_mask: mask,
+                        requested_threads: mask.count_ones() as usize,
+                        reason: format!(
+                            "worker placement on '{0}' targets cluster 'x100' but specifies cores outside X100 mask 0x{X100_CLUSTER_MASK:04X}",
+                            placement.model_id
+                        ),
+                    }));
+                }
+            } else if cluster == "a100" {
                 if (mask & self.active_control_mask) != 0 {
                     return Err(ManagerError::Affinity(K3Error::AffinityError {
                         requested_mask: mask,
