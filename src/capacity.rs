@@ -100,8 +100,20 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
                 u64::from_str_radix(hex_str, 16).map_err(|e| {
                     ManagerError::WorkerSpawn(format!("invalid hex affinity '{aff_str}': {e}"))
                 })?
+            } else if trimmed.contains('-') || trimmed.contains(',') {
+                if let Ok(val) = parse_cpuset_list(trimmed) {
+                    val
+                } else {
+                    return Err(ManagerError::WorkerSpawn(format!(
+                        "invalid integer affinity '{aff_str}': parse error"
+                    )));
+                }
             } else if let Ok(val) = trimmed.parse::<u64>() {
-                val
+                if cluster == "a100" && (8..=15).contains(&val) {
+                    1_u64 << val
+                } else {
+                    val
+                }
             } else if let Ok(val) = parse_cpuset_list(trimmed) {
                 val
             } else {

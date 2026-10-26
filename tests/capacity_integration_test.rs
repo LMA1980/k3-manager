@@ -27,7 +27,7 @@ use k3_manager::supervisor::{WorkerPlacement, WorkerSupervisor};
 use k3_manager::{
     A100_CLUSTER_MASK, ControlPlaneCapacityConfig, ControlPlaneScheduler,
     DEFAULT_ACTIVE_CONTROL_MASK, DEFAULT_SPARE_RECOVERY_MASK, DEFAULT_X100_COMPUTE_CAP_MASK,
-    ResolvedControlCapacityExt, X100_CLUSTER_MASK,
+    ResolvedControlCapacityExt, X100_CLUSTER_MASK, resolve_worker_compute_mask,
 };
 
 // ============================================================================
@@ -274,8 +274,10 @@ fn test_supervisor_spawn_worker_rejects_active_control_encroachment() {
     let arena = SharedMemoryArena::create("encroach_test_arena", 4096).expect("create arena");
     let mut supervisor = WorkerSupervisor::new();
 
-    // Attempting to spawn worker requesting cores 6 or 7 (0x00C0, 0x0040, 0x0080, 0x00FF)
-    for bad_aff in &["0x0040", "0x0080", "0x00C0", "0x00FF"] {
+    // Attempting to spawn worker requesting cores 6 or 7 (0x00C0, 0x0040, 0x0080, 0x00FF, cpuset 6-6, 7-7, 6-7, 6,7, 0-6, 0-7)
+    for bad_aff in &[
+        "0x0040", "0x0080", "0x00C0", "0x00FF", "6-6", "7-7", "6-7", "6,7", "0-6", "0-7",
+    ] {
         let placement = WorkerPlacement::new("rogue_model", &dummy_weights, &dummy_socket, "x100")
             .with_affinity(*bad_aff);
 
@@ -421,4 +423,97 @@ fn test_worker_placement_non_contiguous_affinity() {
         .unwrap_err();
     assert!(matches!(err, ManagerError::Affinity(_)));
     assert!(format!("{err}").contains("exceeding 2 available cores in affinity mask 0x0005"));
+}
+
+#[test]
+fn test_worker_placement_single_core_cpuset_syntax() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // Single core "0-0" on X100 -> valid (mask 0x0001, 1 core)
+    let p_x100_core0 =
+        WorkerPlacement::new("m_core0", &weights, &socket, "x100").with_affinity("0-0");
+    assert!(res.validate_worker_placement(&p_x100_core0).is_ok());
+
+    // Single core "5-5" on X100 -> valid (mask 0x0020, core 5 within X100 compute cap)
+    let p_x100_core5 =
+        WorkerPlacement::new("m_core5", &weights, &socket, "x100").with_affinity("5-5");
+    assert!(res.validate_worker_placement(&p_x100_core5).is_ok());
+
+    // Single core "6-6" on X100 -> rejected (encroaches on active control core 6, 0x0040)
+    let p_x100_core6 =
+        WorkerPlacement::new("m_core6", &weights, &socket, "x100").with_affinity("6-6");
+    let err_c6 = res.validate_worker_placement(&p_x100_core6).unwrap_err();
+    assert!(matches!(err_c6, ManagerError::Affinity(_)));
+    assert!(format!("{err_c6}").contains("encroaches on dedicated active control cores 0x00C0"));
+
+    // Single core "7-7" on X100 -> rejected (encroaches on active control core 7, 0x0080)
+    let p_x100_core7 =
+        WorkerPlacement::new("m_core7", &weights, &socket, "x100").with_affinity("7-7");
+    let err_c7 = res.validate_worker_placement(&p_x100_core7).unwrap_err();
+    assert!(matches!(err_c7, ManagerError::Affinity(_)));
+    assert!(format!("{err_c7}").contains("encroaches on dedicated active control cores 0x00C0"));
+
+    // Single core "8" on A100 -> valid (core 8 on A100, mask 0x0100)
+    let p_a100_core8 =
+        WorkerPlacement::new("m_core8", &weights, &socket, "a100").with_affinity("8");
+    assert!(res.validate_worker_placement(&p_a100_core8).is_ok());
+
+    // Single core "8-8" on X100 -> rejected (outside X100 mask 0x00FF)
+    let p_x100_core8 =
+        WorkerPlacement::new("m_x100_core8", &weights, &socket, "x100").with_affinity("8-8");
+    let err_x100_c8 = res.validate_worker_placement(&p_x100_core8).unwrap_err();
+    assert!(matches!(err_x100_c8, ManagerError::Affinity(_)));
+    assert!(format!("{err_x100_c8}").contains("specifies cores outside X100 mask 0x00FF"));
+
+    // Single core "0-0" on A100 -> rejected (outside A100 mask 0xFF00)
+    let p_a100_core0 =
+        WorkerPlacement::new("m_a100_core0", &weights, &socket, "a100").with_affinity("0-0");
+    let err_a100_c0 = res.validate_worker_placement(&p_a100_core0).unwrap_err();
+    assert!(matches!(err_a100_c0, ManagerError::Affinity(_)));
+    assert!(format!("{err_a100_c0}").contains("specifies cores outside A100 mask 0xFF00"));
+
+    // Mask "0" -> rejected by resolve_worker_compute_mask as zero mask
+    let p_zero_mask = WorkerPlacement::new("m_zero", &weights, &socket, "x100").with_affinity("0");
+    let err_zero = resolve_worker_compute_mask(&p_zero_mask).unwrap_err();
+    assert!(matches!(err_zero, ManagerError::Affinity(_)));
+    assert!(format!("{err_zero}").contains("cannot be zero"));
+}
+
+#[test]
+fn test_supervisor_recover_worker_enforces_capacity() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("recover_cap_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Spawning model with 4 threads is valid under default capacity (cap 6)
+    let placement = WorkerPlacement::new("recover_model", &dummy_weights, &dummy_socket, "x100")
+        .with_threads(4);
+
+    let _dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    // Pre-insert a dummy managed worker entry to simulate a registered worker needing recovery
+    let err = supervisor.recover_worker("nonexistent").unwrap_err();
+    assert!(matches!(err, ManagerError::ModelNotFound(_)));
+
+    // Now test capacity rejection during recover_worker:
+    // If capacity is reduced to minimal mode on 4-core online mask (0x000F, cores 0..2 compute cap = 3 cores)
+    let degraded_cap = ControlPlaneCapacityConfig::minimal()
+        .resolve_with_online_mask(0x000F)
+        .expect("resolve degraded");
+
+    supervisor.set_capacity(degraded_cap);
+    // Directly validate that a 4-thread placement under the degraded capacity will fail (4 > 3 cores)
+    let err_cap = supervisor
+        .capacity()
+        .validate_worker_placement(&placement)
+        .unwrap_err();
+    assert!(matches!(err_cap, ManagerError::Affinity(_)));
+    assert!(format!("{err_cap}").contains("exceeding X100 max compute limit 3"));
 }
