@@ -480,6 +480,91 @@ fn test_worker_placement_single_core_cpuset_syntax() {
     let err_zero = resolve_worker_compute_mask(&p_zero_mask).unwrap_err();
     assert!(matches!(err_zero, ManagerError::Affinity(_)));
     assert!(format!("{err_zero}").contains("cannot be zero"));
+
+    // Placement with threads on mask "0" -> rejected by validate_worker_placement (1 > 0 cores)
+    let p_zero_threads = WorkerPlacement::new("m_zero_t", &weights, &socket, "x100")
+        .with_affinity("0")
+        .with_threads(1);
+    let err_val_zero_t = res.validate_worker_placement(&p_zero_threads).unwrap_err();
+    assert!(matches!(err_val_zero_t, ManagerError::Affinity(_)));
+    assert!(
+        format!("{err_val_zero_t}").contains("exceeding 0 available cores in affinity mask 0x0000")
+    );
+}
+
+#[test]
+fn test_worker_placement_threads_without_affinity_and_a100_submask_bounding() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // 1. Threads without affinity across X100 and A100
+    // X100 with 6 threads -> OK (default cap is 6)
+    let p_x100_t6 = WorkerPlacement::new("m_x100_t6", &weights, &socket, "x100").with_threads(6);
+    assert!(res.validate_worker_placement(&p_x100_t6).is_ok());
+
+    // X100 with 7 threads -> rejected
+    let p_x100_t7 = WorkerPlacement::new("m_x100_t7", &weights, &socket, "x100").with_threads(7);
+    let err_x100_t7 = res.validate_worker_placement(&p_x100_t7).unwrap_err();
+    assert!(matches!(err_x100_t7, ManagerError::Affinity(_)));
+    assert!(format!("{err_x100_t7}").contains("exceeding X100 max compute limit 6"));
+
+    // A100 with 8 threads -> OK (default cap is 8)
+    let p_a100_t8 = WorkerPlacement::new("m_a100_t8", &weights, &socket, "a100").with_threads(8);
+    assert!(res.validate_worker_placement(&p_a100_t8).is_ok());
+
+    // A100 with 9 threads -> rejected
+    let p_a100_t9 = WorkerPlacement::new("m_a100_t9", &weights, &socket, "a100").with_threads(9);
+    let err_a100_t9 = res.validate_worker_placement(&p_a100_t9).unwrap_err();
+    assert!(matches!(err_a100_t9, ManagerError::Affinity(_)));
+    assert!(format!("{err_a100_t9}").contains("exceeding A100 max compute limit 8"));
+
+    // 2. A100 sub-mask thread bounding
+    // A100 with "8-9" (2 cores) and 2 threads -> OK
+    let p_a100_sub2 = WorkerPlacement::new("m_a100_sub2", &weights, &socket, "a100")
+        .with_affinity("8-9")
+        .with_threads(2);
+    assert!(res.validate_worker_placement(&p_a100_sub2).is_ok());
+
+    // A100 with "8-9" (2 cores) and 3 threads -> rejected
+    let p_a100_sub3 = WorkerPlacement::new("m_a100_sub3", &weights, &socket, "a100")
+        .with_affinity("8-9")
+        .with_threads(3);
+    let err_a100_sub3 = res.validate_worker_placement(&p_a100_sub3).unwrap_err();
+    assert!(matches!(err_a100_sub3, ManagerError::Affinity(_)));
+    assert!(
+        format!("{err_a100_sub3}").contains("exceeding 2 available cores in affinity mask 0x0300")
+    );
+
+    // 3. Robustness against whitespace in cpuset list/ranges
+    // " 0 - 5 " on X100 -> OK (0x003F)
+    let p_ws_range =
+        WorkerPlacement::new("m_ws_range", &weights, &socket, "x100").with_affinity("  0 - 5  ");
+    assert!(res.validate_worker_placement(&p_ws_range).is_ok());
+    assert_eq!(resolve_worker_compute_mask(&p_ws_range).unwrap(), 0x003F);
+
+    // " 0 , 2 , 4 " on X100 -> OK (0x0015)
+    let p_ws_list =
+        WorkerPlacement::new("m_ws_list", &weights, &socket, "x100").with_affinity(" 0 , 2 , 4 ");
+    assert!(res.validate_worker_placement(&p_ws_list).is_ok());
+    assert_eq!(resolve_worker_compute_mask(&p_ws_list).unwrap(), 0x0015);
+
+    // " 8 - 15 " on A100 -> OK (0xFF00)
+    let p_ws_a100 =
+        WorkerPlacement::new("m_ws_a100", &weights, &socket, "a100").with_affinity(" 8 - 15 ");
+    assert!(res.validate_worker_placement(&p_ws_a100).is_ok());
+    assert_eq!(resolve_worker_compute_mask(&p_ws_a100).unwrap(), 0xFF00);
+
+    // " 8 - 9 " with 3 threads and whitespace on A100 -> rejected
+    let p_ws_sub3 = WorkerPlacement::new("m_ws_sub3", &weights, &socket, "a100")
+        .with_affinity("  8 - 9  ")
+        .with_threads(3);
+    let err_ws_sub3 = res.validate_worker_placement(&p_ws_sub3).unwrap_err();
+    assert!(matches!(err_ws_sub3, ManagerError::Affinity(_)));
+    assert!(
+        format!("{err_ws_sub3}").contains("exceeding 2 available cores in affinity mask 0x0300")
+    );
 }
 
 #[test]

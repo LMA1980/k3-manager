@@ -183,7 +183,7 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
             }
 
             if let Some(threads) = placement.threads {
-                if mask != 0 && threads as usize > mask.count_ones() as usize {
+                if threads as usize > mask.count_ones() as usize {
                     return Err(ManagerError::Affinity(K3Error::AffinityError {
                         requested_mask: mask,
                         requested_threads: threads as usize,
