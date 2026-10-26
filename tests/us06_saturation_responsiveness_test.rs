@@ -144,6 +144,16 @@ fn test_scenario1_control_responsiveness_under_100_percent_compute_saturation() 
                 .is_stop_token("model-saturated", 1001)
                 .expect("stop token check")
         );
+        assert!(
+            runtime
+                .is_stop_sequence("model-saturated", "some text <|im_end|>")
+                .expect("stop sequence check")
+        );
+        assert!(
+            !runtime
+                .is_stop_sequence("model-saturated", "continue generating")
+                .expect("stop sequence check")
+        );
 
         // Operation E: Queue status reporting
         runtime.increment_queue_depth();
@@ -180,6 +190,21 @@ fn test_scenario1_control_responsiveness_under_100_percent_compute_saturation() 
                 .dispatch_match_prefix("project-test", "model-saturated", q_tokens)
                 .expect("dispatch match prefix");
             assert_eq!(dispatched_match.matched_blocks, vec![10]);
+
+            let disp_stop = runtime
+                .dispatch_is_stop_token("model-saturated", 2)
+                .expect("dispatch stop token");
+            assert!(disp_stop);
+
+            let disp_seq = runtime
+                .dispatch_is_stop_sequence("model-saturated", "done <|im_end|>")
+                .expect("dispatch stop sequence");
+            assert!(disp_seq);
+
+            let disp_admin = runtime
+                .dispatch_execute_admin(AdminCommand::Ping)
+                .expect("dispatch admin ping");
+            assert_eq!(disp_admin, AdminResponse::Pong);
         }
 
         let elapsed = t0.elapsed();

@@ -20,7 +20,7 @@ use crate::error::ManagerError;
 use crate::prefix::{PrefixCacheStats, PrefixMatchResult, PrefixRadixIndex};
 use crate::prompt::{
     ChatTemplate, GgufTokenizer, IncrementalStopDetector, PreparedPrompt, PromptOrchestrator,
-    PromptPreparationRequest, Tokenizer,
+    PromptPreparationRequest, SpecialTokens, Tokenizer,
 };
 use k3_core::affinity::ResolvedControlCapacity;
 
@@ -130,8 +130,8 @@ pub struct ControlPlaneRuntime {
     affinity_backend: Arc<dyn OsAffinityBackend>,
     prefix_index: Arc<PrefixRadixIndex>,
     prompt_orchestrator: Arc<PromptOrchestrator>,
-    queue_depth: AtomicUsize,
-    placements: RwLock<HashMap<String, ModelPlacementRecord>>,
+    queue_depth: Arc<AtomicUsize>,
+    placements: Arc<RwLock<HashMap<String, ModelPlacementRecord>>>,
     control_workers: Vec<ControlWorkerThread>,
 }
 
@@ -197,8 +197,8 @@ impl ControlPlaneRuntime {
             affinity_backend,
             prefix_index: Arc::new(PrefixRadixIndex::new()),
             prompt_orchestrator: Arc::new(PromptOrchestrator::new()),
-            queue_depth: AtomicUsize::new(0),
-            placements: RwLock::new(HashMap::new()),
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            placements: Arc::new(RwLock::new(HashMap::new())),
             control_workers,
         })
     }
@@ -373,6 +373,72 @@ impl ControlPlaneRuntime {
         })
     }
 
+    /// Dispatches stop token evaluation to execute on a dedicated active control thread (ADR-007).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if stop check or worker thread dispatch fails.
+    pub fn dispatch_is_stop_token(
+        &self,
+        model_id: impl Into<String>,
+        token_id: u32,
+    ) -> Result<bool, ManagerError> {
+        let m_id = model_id.into();
+        let orchestrator = Arc::clone(&self.prompt_orchestrator);
+        self.dispatch_control_task(move |_| orchestrator.is_stop_token(&m_id, token_id))?
+    }
+
+    /// Dispatches stop sequence evaluation to execute on a dedicated active control thread (ADR-007).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if sequence check or worker thread dispatch fails.
+    pub fn dispatch_is_stop_sequence(
+        &self,
+        model_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<bool, ManagerError> {
+        let m_id = model_id.into();
+        let t_text = text.into();
+        let orchestrator = Arc::clone(&self.prompt_orchestrator);
+        self.dispatch_control_task(move |_| orchestrator.is_stop_sequence(&m_id, &t_text))?
+    }
+
+    /// Dispatches prefix insertion to execute on a dedicated active control thread (ADR-007).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if insertion or worker thread dispatch fails.
+    pub fn dispatch_insert_prefix(
+        &self,
+        project_id: impl Into<String>,
+        model_id: impl Into<String>,
+        token_ids: Vec<u32>,
+        block_ids: Vec<u32>,
+    ) -> Result<usize, ManagerError> {
+        let p_id = project_id.into();
+        let m_id = model_id.into();
+        let prefix_index = Arc::clone(&self.prefix_index);
+        self.dispatch_control_task(move |_| {
+            prefix_index.insert(&p_id, &m_id, &token_ids, &block_ids)
+        })
+    }
+
+    /// Dispatches an administrative command to execute on a dedicated active control thread (ADR-007).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if execution or worker thread dispatch fails.
+    pub fn dispatch_execute_admin(&self, cmd: AdminCommand) -> Result<AdminResponse, ManagerError> {
+        let cap = self.scheduler.capacity().clone();
+        let p_idx = Arc::clone(&self.prefix_index);
+        let q_depth = Arc::clone(&self.queue_depth);
+        let pl_map = Arc::clone(&self.placements);
+        self.dispatch_control_task(move |_| {
+            Self::execute_admin_core(&cap, &p_idx, &q_depth, &pl_map, cmd)
+        })?
+    }
+
     // ========================================================================
     // Tokenizer & Chat Template Orchestration
     // ========================================================================
@@ -496,6 +562,24 @@ impl ControlPlaneRuntime {
         self.prompt_orchestrator.is_stop_token(model_id, token_id)
     }
 
+    /// Retrieves the active [`SpecialTokens`] configuration for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if `model_id` is not registered.
+    pub fn get_special_tokens(&self, model_id: &str) -> Result<SpecialTokens, ManagerError> {
+        self.prompt_orchestrator.get_special_tokens(model_id)
+    }
+
+    /// Checks if `text` contains any configured stop sequences for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if `model_id` is not registered.
+    pub fn is_stop_sequence(&self, model_id: &str, text: &str) -> Result<bool, ManagerError> {
+        self.prompt_orchestrator.is_stop_sequence(model_id, text)
+    }
+
     /// Creates an [`IncrementalStopDetector`] for streaming generation turn.
     ///
     /// # Errors
@@ -525,6 +609,7 @@ impl ControlPlaneRuntime {
     }
 
     /// Inserts 16-token aligned blocks into the prefix radix index.
+    #[allow(clippy::must_use_candidate)]
     pub fn insert_prefix(
         &self,
         project_id: &str,
@@ -537,11 +622,13 @@ impl ControlPlaneRuntime {
     }
 
     /// Invalidates all cached prefix blocks for a model.
+    #[allow(clippy::must_use_candidate)]
     pub fn invalidate_prefix_model(&self, project_id: &str, model_id: &str) -> usize {
         self.prefix_index.invalidate_model(project_id, model_id)
     }
 
     /// Invalidates all cached prefix blocks for a project.
+    #[allow(clippy::must_use_candidate)]
     pub fn invalidate_prefix_project(&self, project_id: &str) -> usize {
         self.prefix_index.invalidate_project(project_id)
     }
@@ -563,11 +650,13 @@ impl ControlPlaneRuntime {
     }
 
     /// Increments admission queue depth upon request arrival.
+    #[allow(clippy::must_use_candidate)]
     pub fn increment_queue_depth(&self) -> usize {
         self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Decrements admission queue depth upon request dispatch.
+    #[allow(clippy::must_use_candidate)]
     pub fn decrement_queue_depth(&self) -> usize {
         let mut curr = self.queue_depth.load(Ordering::Relaxed);
         loop {
@@ -659,38 +748,53 @@ impl ControlPlaneRuntime {
     // Administrative Command Dispatch
     // ========================================================================
 
-    /// Executes an administrative command without blocking on compute worker forward passes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ManagerError`] if the administrative command fails.
-    pub fn execute_admin(&self, cmd: AdminCommand) -> Result<AdminResponse, ManagerError> {
+    fn execute_admin_core(
+        capacity: &ResolvedControlCapacity,
+        prefix_index: &Arc<PrefixRadixIndex>,
+        queue_depth: &Arc<AtomicUsize>,
+        placements: &Arc<RwLock<HashMap<String, ModelPlacementRecord>>>,
+        cmd: AdminCommand,
+    ) -> Result<AdminResponse, ManagerError> {
         match cmd {
             AdminCommand::Ping => Ok(AdminResponse::Pong),
-            AdminCommand::InspectCapacity => {
-                Ok(AdminResponse::Capacity(self.scheduler.capacity().clone()))
-            }
-            AdminCommand::GetQueueDepth => Ok(AdminResponse::QueueDepth(self.queue_depth())),
-            AdminCommand::GetActivePlacements => Ok(AdminResponse::ActivePlacements(
-                self.active_model_placements(),
+            AdminCommand::InspectCapacity => Ok(AdminResponse::Capacity(capacity.clone())),
+            AdminCommand::GetQueueDepth => Ok(AdminResponse::QueueDepth(
+                queue_depth.load(Ordering::Relaxed),
             )),
+            AdminCommand::GetActivePlacements => {
+                let map = placements.read().unwrap_or_else(PoisonError::into_inner);
+                let mut keys: Vec<String> = map.keys().cloned().collect();
+                keys.sort_unstable();
+                Ok(AdminResponse::ActivePlacements(keys))
+            }
             AdminCommand::GetWorkerHealth => {
-                Ok(AdminResponse::WorkerHealth(self.worker_health_snapshots()))
+                let map = placements.read().unwrap_or_else(PoisonError::into_inner);
+                let snapshots = map
+                    .values()
+                    .map(|r| WorkerHealthSnapshot {
+                        model_id: r.model_id.clone(),
+                        pid: r.pid,
+                        cluster: r.cluster.clone(),
+                        is_alive: r.is_alive,
+                        generation: r.generation,
+                    })
+                    .collect();
+                Ok(AdminResponse::WorkerHealth(snapshots))
             }
             AdminCommand::GetPrefixCacheStats => {
-                Ok(AdminResponse::PrefixCacheStats(self.prefix_cache_stats()))
+                Ok(AdminResponse::PrefixCacheStats(prefix_index.stats()))
             }
             AdminCommand::ClearPrefixCache {
                 project_id,
                 model_id,
             } => {
                 let cleared = match (project_id, model_id) {
-                    (Some(p), Some(m)) => self.invalidate_prefix_model(&p, &m),
-                    (Some(p), None) => self.invalidate_prefix_project(&p),
-                    (None, Some(m)) => self.prefix_index.invalidate_model_all_projects(&m),
+                    (Some(p), Some(m)) => prefix_index.invalidate_model(&p, &m),
+                    (Some(p), None) => prefix_index.invalidate_project(&p),
+                    (None, Some(m)) => prefix_index.invalidate_model_all_projects(&m),
                     (None, None) => {
-                        let stats = self.prefix_cache_stats();
-                        self.prefix_index.clear();
+                        let stats = prefix_index.stats();
+                        prefix_index.clear();
                         stats.total_cached_blocks
                     }
                 };
@@ -701,14 +805,42 @@ impl ControlPlaneRuntime {
                 weights_path: _,
                 cluster,
             } => {
-                self.record_model_placement(model_id.clone(), cluster, None);
+                crate::domain::validate_model_id(&model_id)?;
+                let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
+                map.insert(
+                    model_id.clone(),
+                    ModelPlacementRecord {
+                        model_id: model_id.clone(),
+                        cluster,
+                        pid: None,
+                        is_alive: true,
+                        generation: 1,
+                    },
+                );
                 Ok(AdminResponse::ModelRegistered(model_id))
             }
             AdminCommand::UnregisterModel { model_id } => {
-                self.remove_model_placement(&model_id);
+                crate::domain::validate_model_id(&model_id)?;
+                let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
+                map.remove(&model_id);
                 Ok(AdminResponse::ModelUnregistered(model_id))
             }
         }
+    }
+
+    /// Executes an administrative command without blocking on compute worker forward passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if the administrative command fails.
+    pub fn execute_admin(&self, cmd: AdminCommand) -> Result<AdminResponse, ManagerError> {
+        Self::execute_admin_core(
+            self.scheduler.capacity(),
+            &self.prefix_index,
+            &self.queue_depth,
+            &self.placements,
+            cmd,
+        )
     }
 }
 

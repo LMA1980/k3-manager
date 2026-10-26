@@ -228,19 +228,15 @@ impl ModelPrefixTree {
             if leaves.is_empty() {
                 break;
             }
-            leaves.sort_by_key(|(tick, _)| *tick);
-
-            let mut progress = false;
-            for (_, block_id) in leaves {
-                if self.invalidate_block(block_id) {
-                    evicted.push(block_id);
-                    progress = true;
-                    if evicted.len() >= max_blocks {
-                        break;
-                    }
+            // Strictly select the oldest leaf currently in the tree
+            if let Some((_, oldest_block_id)) = leaves.iter().min_by_key(|(tick, _)| *tick) {
+                let id = *oldest_block_id;
+                if self.invalidate_block(id) {
+                    evicted.push(id);
+                } else {
+                    break;
                 }
-            }
-            if !progress {
+            } else {
                 break;
             }
         }
@@ -248,7 +244,7 @@ impl ModelPrefixTree {
     }
 }
 
-type PrefixTreeMap = HashMap<(String, String), Arc<RwLock<ModelPrefixTree>>>;
+type PrefixTreeMap = HashMap<String, HashMap<String, Arc<RwLock<ModelPrefixTree>>>>;
 
 /// Concurrent control-plane prefix radix index keyed by `(project_id, model_id, token_ids)`.
 #[derive(Debug, Default)]
@@ -281,7 +277,8 @@ impl PrefixRadixIndex {
 
         let tree_arc = {
             let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
-            map.get(&(project_id.to_owned(), model_id.to_owned()))
+            map.get(project_id)
+                .and_then(|models| models.get(model_id))
                 .cloned()
         };
 
@@ -315,16 +312,19 @@ impl PrefixRadixIndex {
         token_ids: &[u32],
         block_ids: &[u32],
     ) -> usize {
-        let key = (project_id.to_owned(), model_id.to_owned());
         let tree_arc = {
             let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
-            map.get(&key).cloned()
+            map.get(project_id)
+                .and_then(|models| models.get(model_id))
+                .cloned()
         };
         let tree_arc = if let Some(arc) = tree_arc {
             arc
         } else {
             let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
-            map.entry(key)
+            map.entry(project_id.to_owned())
+                .or_default()
+                .entry(model_id.to_owned())
                 .or_insert_with(|| Arc::new(RwLock::new(ModelPrefixTree::default())))
                 .clone()
         };
@@ -337,10 +337,10 @@ impl PrefixRadixIndex {
     ///
     /// Returns the number of blocks invalidated.
     pub fn invalidate_model(&self, project_id: &str, model_id: &str) -> usize {
-        let key = (project_id.to_owned(), model_id.to_owned());
         let removed = {
             let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
-            map.remove(&key)
+            map.get_mut(project_id)
+                .and_then(|models| models.remove(model_id))
         };
 
         if let Some(tree) = removed {
@@ -356,12 +356,9 @@ impl PrefixRadixIndex {
     /// Returns the total number of blocks invalidated.
     pub fn invalidate_model_all_projects(&self, model_id: &str) -> usize {
         let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
-        let keys_to_remove: Vec<(String, String)> =
-            map.keys().filter(|(_, m)| m == model_id).cloned().collect();
-
         let mut total_invalidated = 0;
-        for k in keys_to_remove {
-            if let Some(tree) = map.remove(&k) {
+        for models in map.values_mut() {
+            if let Some(tree) = models.remove(model_id) {
                 let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
                 total_invalidated += guard.total_blocks;
             }
@@ -373,31 +370,32 @@ impl PrefixRadixIndex {
     ///
     /// Returns the total number of blocks invalidated.
     pub fn invalidate_project(&self, project_id: &str) -> usize {
-        let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
-        let keys_to_remove: Vec<(String, String)> = map
-            .keys()
-            .filter(|(proj, _)| proj == project_id)
-            .cloned()
-            .collect();
+        let removed = {
+            let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
+            map.remove(project_id)
+        };
 
-        let mut total_invalidated = 0;
-        for k in keys_to_remove {
-            if let Some(tree) = map.remove(&k) {
+        if let Some(models) = removed {
+            let mut total_invalidated = 0;
+            for tree in models.values() {
                 let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
                 total_invalidated += guard.total_blocks;
             }
+            total_invalidated
+        } else {
+            0
         }
-        total_invalidated
     }
 
     /// Invalidates a specific block ID from a `(project_id, model_id)` tree.
     ///
     /// Returns `true` if the block was found and invalidated.
     pub fn invalidate_block(&self, project_id: &str, model_id: &str, block_id: u32) -> bool {
-        let key = (project_id.to_owned(), model_id.to_owned());
         let tree_arc = {
             let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
-            map.get(&key).cloned()
+            map.get(project_id)
+                .and_then(|models| models.get(model_id))
+                .cloned()
         };
 
         if let Some(tree) = tree_arc {
@@ -412,10 +410,11 @@ impl PrefixRadixIndex {
     ///
     /// Returns the physical block IDs that were evicted.
     pub fn evict_lru(&self, project_id: &str, model_id: &str, max_blocks: usize) -> Vec<u32> {
-        let key = (project_id.to_owned(), model_id.to_owned());
         let tree_arc = {
             let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
-            map.get(&key).cloned()
+            map.get(project_id)
+                .and_then(|models| models.get(model_id))
+                .cloned()
         };
 
         if let Some(tree) = tree_arc {
@@ -430,21 +429,24 @@ impl PrefixRadixIndex {
     #[must_use]
     pub fn stats(&self) -> PrefixCacheStats {
         let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
-        let mut projects = std::collections::HashSet::new();
-        let mut models = std::collections::HashSet::new();
+        let mut total_projects = 0;
+        let mut models_set = std::collections::HashSet::new();
         let mut total_blocks = 0;
 
-        for ((proj, model), tree) in map.iter() {
-            projects.insert(proj.clone());
-            models.insert(model.clone());
-            if let Ok(guard) = tree.read() {
+        for models in map.values() {
+            if !models.is_empty() {
+                total_projects += 1;
+            }
+            for (model, tree) in models {
+                models_set.insert(model.clone());
+                let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
                 total_blocks += guard.total_blocks;
             }
         }
 
         PrefixCacheStats {
-            total_projects: projects.len(),
-            total_models: models.len(),
+            total_projects,
+            total_models: models_set.len(),
             total_cached_blocks: total_blocks,
             lookup_count: self.lookup_count.load(Ordering::Relaxed),
             hit_count: self.hit_count.load(Ordering::Relaxed),

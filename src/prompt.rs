@@ -128,12 +128,29 @@ impl IncrementalStopDetector {
 
     /// Feeds the next generated `token_id`. Returns `true` if this token halts generation.
     pub fn push_token(&mut self, token_id: u32) -> bool {
+        self.push_token_with_text(token_id, None)
+    }
+
+    /// Feeds next generated `token_id` and optional decoded text fragment.
+    /// Returns `true` if generation is halted by token ID or text stop sequence.
+    pub fn push_token_with_text(&mut self, token_id: u32, text_fragment: Option<&str>) -> bool {
         if self.stopped {
             return true;
         }
         if self.special_tokens.is_stop(token_id) {
             self.stopped = true;
             return true;
+        }
+        if let Some(fragment) = text_fragment {
+            if self
+                .special_tokens
+                .stop_sequences
+                .iter()
+                .any(|seq| !seq.is_empty() && fragment.contains(seq.as_str()))
+            {
+                self.stopped = true;
+                return true;
+            }
         }
         self.observed_tokens.push(token_id);
         false
@@ -213,6 +230,12 @@ impl PromptOrchestrator {
         if let Ok(map) = self.gguf_tokenizers.read() {
             if let Some(tok) = map.get(model_id) {
                 return Ok(tok.chat_template().format_prompt(user_prompt));
+            }
+        }
+
+        if let Ok(map) = self.tokenizers.read() {
+            if map.contains_key(model_id) {
+                return Ok(user_prompt.to_owned());
             }
         }
 
@@ -358,7 +381,44 @@ impl PromptOrchestrator {
                 return Ok(tok.chat_template().clone());
             }
         }
+        if let Ok(map) = self.tokenizers.read() {
+            if map.contains_key(model_id) {
+                return Ok(ChatTemplate::new(None));
+            }
+        }
         Err(ManagerError::ModelNotFound(model_id.to_owned()))
+    }
+
+    /// Retrieves the active [`SpecialTokens`] configuration for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if `model_id` is not registered.
+    pub fn get_special_tokens(&self, model_id: &str) -> Result<SpecialTokens, ManagerError> {
+        if let Ok(map) = self.gguf_tokenizers.read() {
+            if let Some(tok) = map.get(model_id) {
+                return Ok(tok.special_tokens().clone());
+            }
+        }
+        if let Ok(map) = self.tokenizers.read() {
+            if let Some(tok) = map.get(model_id) {
+                return Ok(tok.special_tokens().clone());
+            }
+        }
+        Err(ManagerError::ModelNotFound(model_id.to_owned()))
+    }
+
+    /// Checks if a text fragment contains any configured stop sequences for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if `model_id` is not registered.
+    pub fn is_stop_sequence(&self, model_id: &str, text: &str) -> Result<bool, ManagerError> {
+        let special = self.get_special_tokens(model_id)?;
+        Ok(special
+            .stop_sequences
+            .iter()
+            .any(|seq| !seq.is_empty() && text.contains(seq.as_str())))
     }
 
     /// Decodes a sequence of token IDs into text using `model_id`'s tokenizer.

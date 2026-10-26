@@ -511,3 +511,249 @@ fn test_sub_issue_74_dispatched_control_plane_methods() {
         .unwrap();
     assert_eq!(match_res.matched_blocks, vec![99]);
 }
+
+#[test]
+fn test_sub_issue_73_strict_lru_branching_eviction() {
+    let index = PrefixRadixIndex::new();
+
+    // Branch 1: Node P (block 1) -> Leaf X (block 2)
+    let b1: Vec<u32> = (0..16).collect();
+    let b2: Vec<u32> = (16..32).collect();
+    let mut seq1 = Vec::new();
+    seq1.extend_from_slice(&b1);
+    seq1.extend_from_slice(&b2);
+    index.insert("p-lru", "m-lru", &seq1, &[1, 2]);
+
+    // Branch 2: Root Node Y (block 3)
+    let b3: Vec<u32> = (32..48).collect();
+    index.insert("p-lru", "m-lru", &b3, &[3]);
+
+    assert_eq!(index.stats().total_cached_blocks, 3);
+
+    // Initial state:
+    // P (block 1, tick 1) -> X (block 2, tick 2)
+    // Y (block 3, tick 3)
+    // Leaves at start: X (tick 2), Y (tick 3)
+    // Request eviction of 2 blocks:
+    // 1st eviction: X (block 2) is evicted because tick 2 < tick 3.
+    // Once X is evicted, P (block 1, tick 1) is now a leaf!
+    // 2nd eviction: leaves are P (tick 1) and Y (tick 3).
+    // P (tick 1) is OLDER than Y (tick 3), so P MUST be evicted next!
+    // Strict LRU eviction order: [2, 1]. Y (block 3) remains!
+    let evicted = index.evict_lru("p-lru", "m-lru", 2);
+    assert_eq!(evicted, vec![2, 1]);
+    assert_eq!(index.stats().total_cached_blocks, 1);
+
+    // Verify Y (block 3) is intact and can be matched
+    let match_y = index.match_longest_prefix("p-lru", "m-lru", &b3);
+    assert_eq!(match_y.matched_blocks, vec![3]);
+
+    // Verify seq1 is completely gone
+    let match_seq1 = index.match_longest_prefix("p-lru", "m-lru", &seq1);
+    assert!(match_seq1.is_empty());
+}
+
+#[test]
+fn test_sub_issue_72_general_tokenizer_default_template() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    let tok = create_test_simple_tokenizer();
+    runtime.register_tokenizer("plain-model", Arc::new(tok));
+
+    // format_prompt returns prompt unchanged (identity template) instead of ModelNotFound
+    let formatted = runtime
+        .format_prompt("plain-model", "test message")
+        .unwrap();
+    assert_eq!(formatted, "test message");
+
+    // get_template returns default ChatTemplate::new(None)
+    let tmpl = runtime.get_template("plain-model").unwrap();
+    assert_eq!(tmpl.format_prompt("sample"), "sample");
+    assert!(tmpl.raw_template().is_none());
+}
+
+#[test]
+fn test_sub_issue_74_admin_register_model_validation() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    // Traversal rejection
+    let res_traversal = runtime.execute_admin(AdminCommand::RegisterModel {
+        model_id: "../escaped-model".to_owned(),
+        weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+        cluster: "x100".to_owned(),
+    });
+    assert!(res_traversal.is_err());
+
+    // Whitespace rejection
+    let res_whitespace = runtime.execute_admin(AdminCommand::RegisterModel {
+        model_id: "  spaced  ".to_owned(),
+        weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+        cluster: "x100".to_owned(),
+    });
+    assert!(res_whitespace.is_err());
+
+    // Empty model_id rejection
+    let res_empty = runtime.execute_admin(AdminCommand::RegisterModel {
+        model_id: String::new(),
+        weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+        cluster: "x100".to_owned(),
+    });
+    assert!(res_empty.is_err());
+
+    // Valid model_id succeeds
+    let res_ok = runtime.execute_admin(AdminCommand::RegisterModel {
+        model_id: "valid-qwen-7b".to_owned(),
+        weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+        cluster: "x100".to_owned(),
+    });
+    assert_eq!(
+        res_ok.unwrap(),
+        AdminResponse::ModelRegistered("valid-qwen-7b".to_owned())
+    );
+}
+
+#[test]
+fn test_sub_issue_72_text_stop_sequence_and_dispatched_detection() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    let mut tok = create_test_simple_tokenizer();
+    let special = SpecialTokens {
+        bos_token_id: Some(1),
+        eos_token_id: Some(2),
+        eot_token_id: Some(3),
+        padding_token_id: Some(0),
+        add_bos_token: false,
+        stop_tokens: vec![2, 3],
+        stop_sequences: vec!["<|im_end|>".to_owned(), "### STOP".to_owned()],
+    };
+    tok.set_special_tokens(special);
+    runtime.register_tokenizer("m-stop", Arc::new(tok));
+
+    // 1. Synchronous text stop sequence checks
+    assert!(
+        runtime
+            .is_stop_sequence("m-stop", "response text <|im_end|>\n")
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .is_stop_sequence("m-stop", "halt now ### STOP immediately")
+            .unwrap()
+    );
+    assert!(!runtime.is_stop_sequence("m-stop", "normal output").unwrap());
+
+    // 2. Dispatched stop checks on dedicated active control threads
+    let disp_token_stop = runtime
+        .dispatch_is_stop_token("m-stop".to_owned(), 2)
+        .unwrap();
+    assert!(disp_token_stop);
+
+    let disp_token_ok = runtime
+        .dispatch_is_stop_token("m-stop".to_owned(), 1000)
+        .unwrap();
+    assert!(!disp_token_ok);
+
+    let disp_seq_stop = runtime
+        .dispatch_is_stop_sequence("m-stop".to_owned(), "final tokens <|im_end|>".to_owned())
+        .unwrap();
+    assert!(disp_seq_stop);
+
+    let disp_seq_ok = runtime
+        .dispatch_is_stop_sequence("m-stop".to_owned(), "keep generating".to_owned())
+        .unwrap();
+    assert!(!disp_seq_ok);
+
+    // 3. IncrementalStopDetector push_token_with_text
+    let mut detector = runtime.create_stop_detector("m-stop").unwrap();
+    assert!(!detector.is_stopped());
+    assert!(!detector.push_token_with_text(1000, Some("hello")));
+    assert!(!detector.is_stopped());
+
+    // Stop via text fragment
+    assert!(detector.push_token_with_text(1001, Some("<|im_end|>")));
+    assert!(detector.is_stopped());
+}
+
+#[test]
+fn test_sub_issue_74_dispatched_admin_commands_on_active_control_threads() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    // 1. Dispatched ping
+    let ping_resp = runtime.dispatch_execute_admin(AdminCommand::Ping).unwrap();
+    assert_eq!(ping_resp, AdminResponse::Pong);
+
+    // 2. Dispatched InspectCapacity
+    match runtime
+        .dispatch_execute_admin(AdminCommand::InspectCapacity)
+        .unwrap()
+    {
+        AdminResponse::Capacity(cap) => {
+            assert_eq!(cap.active_control_mask, 0x00C0);
+        }
+        other => panic!("expected Capacity response, got {other:?}"),
+    }
+
+    // 3. Dispatched RegisterModel
+    let reg_resp = runtime
+        .dispatch_execute_admin(AdminCommand::RegisterModel {
+            model_id: "disp-model".to_owned(),
+            weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+            cluster: "x100".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(
+        reg_resp,
+        AdminResponse::ModelRegistered("disp-model".to_owned())
+    );
+
+    // 4. Dispatched GetActivePlacements
+    let placements_resp = runtime
+        .dispatch_execute_admin(AdminCommand::GetActivePlacements)
+        .unwrap();
+    assert_eq!(
+        placements_resp,
+        AdminResponse::ActivePlacements(vec!["disp-model".to_owned()])
+    );
+
+    // 5. Dispatched prefix insert
+    let b0: Vec<u32> = (0..16).collect();
+    let inserted = runtime
+        .dispatch_insert_prefix("disp-p", "disp-model", b0.clone(), vec![77])
+        .unwrap();
+    assert_eq!(inserted, 1);
+
+    // 6. Dispatched prefix match
+    let match_res = runtime
+        .dispatch_match_prefix("disp-p", "disp-model", b0)
+        .unwrap();
+    assert_eq!(match_res.matched_blocks, vec![77]);
+
+    // 7. Dispatched ClearPrefixCache
+    let clear_resp = runtime
+        .dispatch_execute_admin(AdminCommand::ClearPrefixCache {
+            project_id: Some("disp-p".to_owned()),
+            model_id: Some("disp-model".to_owned()),
+        })
+        .unwrap();
+    assert_eq!(clear_resp, AdminResponse::CacheCleared(1));
+}
