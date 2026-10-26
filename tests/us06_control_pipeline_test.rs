@@ -757,3 +757,91 @@ fn test_sub_issue_74_dispatched_admin_commands_on_active_control_threads() {
         .unwrap();
     assert_eq!(clear_resp, AdminResponse::CacheCleared(1));
 }
+
+#[test]
+fn test_sub_issue_72_prompt_orchestrator_poison_resilience() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    let tok = create_test_simple_tokenizer();
+    runtime.register_tokenizer("poison-model", Arc::new(tok));
+
+    // Intentionally poison internal locks
+    runtime.prompt_orchestrator().poison_for_test();
+
+    // Verify format_prompt and get_template still function cleanly after poison
+    let formatted = runtime.format_prompt("poison-model", "resilience test");
+    assert!(formatted.is_ok());
+    assert_eq!(formatted.unwrap(), "resilience test");
+
+    let tmpl = runtime.get_template("poison-model");
+    assert!(tmpl.is_ok());
+}
+
+#[test]
+fn test_sub_issue_74_admin_register_model_cluster_validation() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    // Invalid cluster rejected
+    let res_invalid_cluster = runtime.execute_admin(AdminCommand::RegisterModel {
+        model_id: "cluster-test-model".to_owned(),
+        weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+        cluster: "gpu".to_owned(),
+    });
+    assert!(res_invalid_cluster.is_err());
+    let err_str = format!("{:?}", res_invalid_cluster.unwrap_err());
+    assert!(err_str.contains("unsupported cluster 'gpu'"));
+
+    // Case-insensitive valid clusters succeed
+    let reg_x100 = runtime.execute_admin(AdminCommand::RegisterModel {
+        model_id: "m-x100".to_owned(),
+        weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+        cluster: "X100".to_owned(),
+    });
+    assert!(reg_x100.is_ok());
+
+    let placement_a100 = runtime.execute_admin(AdminCommand::RegisterModel {
+        model_id: "m-a100".to_owned(),
+        weights_path: std::path::PathBuf::from("/tmp/weights.gguf"),
+        cluster: "a100".to_owned(),
+    });
+    assert!(placement_a100.is_ok());
+}
+
+#[test]
+fn test_sub_issue_73_empty_project_pruning_on_model_invalidation() {
+    let index = PrefixRadixIndex::new();
+    let b0: Vec<u32> = (0..16).collect();
+
+    index.insert("prune-p1", "m1", &b0, &[10]);
+    index.insert("prune-p2", "m1", &b0, &[20]);
+    index.insert("prune-p2", "m2", &b0, &[30]);
+
+    assert_eq!(index.stats().total_projects, 2);
+
+    // Invalidate m1 from prune-p1 (which now becomes empty)
+    let cleared_p1 = index.invalidate_model("prune-p1", "m1");
+    assert_eq!(cleared_p1, 1);
+    // prune-p1 must be cleanly pruned from total_projects
+    assert_eq!(index.stats().total_projects, 1);
+
+    // Invalidate m1 and m2 across all projects
+    let cleared_all = index.invalidate_model_all_projects("m2");
+    assert_eq!(cleared_all, 1);
+    // prune-p2 still has m1
+    assert_eq!(index.stats().total_projects, 1);
+
+    let cleared_m1_all = index.invalidate_model_all_projects("m1");
+    assert_eq!(cleared_m1_all, 1);
+    // prune-p2 is now empty and pruned
+    assert_eq!(index.stats().total_projects, 0);
+}

@@ -339,8 +339,15 @@ impl PrefixRadixIndex {
     pub fn invalidate_model(&self, project_id: &str, model_id: &str) -> usize {
         let removed = {
             let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
-            map.get_mut(project_id)
-                .and_then(|models| models.remove(model_id))
+            let rem = map
+                .get_mut(project_id)
+                .and_then(|models| models.remove(model_id));
+            if let Some(models) = map.get(project_id) {
+                if models.is_empty() {
+                    map.remove(project_id);
+                }
+            }
+            rem
         };
 
         if let Some(tree) = removed {
@@ -363,6 +370,7 @@ impl PrefixRadixIndex {
                 total_invalidated += guard.total_blocks;
             }
         }
+        map.retain(|_, models| !models.is_empty());
         total_invalidated
     }
 

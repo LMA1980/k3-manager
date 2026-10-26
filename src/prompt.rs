@@ -5,7 +5,7 @@
 //! detection executing exclusively on the control plane without invoking compute workers.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use k3_core::K3Error;
 pub use k3_tokenizer::{
@@ -192,9 +192,11 @@ impl PromptOrchestrator {
 
     /// Registers a general [`Tokenizer`] instance for a model.
     pub fn register_tokenizer(&self, model_id: impl Into<String>, tokenizer: Arc<dyn Tokenizer>) {
-        if let Ok(mut map) = self.tokenizers.write() {
-            map.insert(model_id.into(), tokenizer);
-        }
+        let mut map = self
+            .tokenizers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.insert(model_id.into(), tokenizer);
     }
 
     /// Registers a [`GgufTokenizer`] instance for a model.
@@ -203,16 +205,20 @@ impl PromptOrchestrator {
         model_id: impl Into<String>,
         tokenizer: Arc<GgufTokenizer>,
     ) {
-        if let Ok(mut map) = self.gguf_tokenizers.write() {
-            map.insert(model_id.into(), tokenizer);
-        }
+        let mut map = self
+            .gguf_tokenizers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.insert(model_id.into(), tokenizer);
     }
 
     /// Registers an explicit [`ChatTemplate`] for a model.
     pub fn register_template(&self, model_id: impl Into<String>, template: ChatTemplate) {
-        if let Ok(mut map) = self.templates.write() {
-            map.insert(model_id.into(), template);
-        }
+        let mut map = self
+            .templates
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.insert(model_id.into(), template);
     }
 
     /// Formats a user prompt with the model's chat template.
@@ -221,22 +227,37 @@ impl PromptOrchestrator {
     ///
     /// Returns [`ManagerError::ModelNotFound`] if no template or tokenizer is registered for `model_id`.
     pub fn format_prompt(&self, model_id: &str, user_prompt: &str) -> Result<String, ManagerError> {
-        if let Ok(map) = self.templates.read() {
-            if let Some(tmpl) = map.get(model_id) {
-                return Ok(tmpl.format_prompt(user_prompt));
-            }
+        let tmpl_opt = {
+            let map = self
+                .templates
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            map.get(model_id).cloned()
+        };
+        if let Some(tmpl) = tmpl_opt {
+            return Ok(tmpl.format_prompt(user_prompt));
         }
 
-        if let Ok(map) = self.gguf_tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                return Ok(tok.chat_template().format_prompt(user_prompt));
-            }
+        let gguf_tmpl_opt = {
+            let map = self
+                .gguf_tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            map.get(model_id).map(|tok| tok.chat_template().clone())
+        };
+        if let Some(tmpl) = gguf_tmpl_opt {
+            return Ok(tmpl.format_prompt(user_prompt));
         }
 
-        if let Ok(map) = self.tokenizers.read() {
-            if map.contains_key(model_id) {
-                return Ok(user_prompt.to_owned());
-            }
+        let has_general_tok = {
+            let map = self
+                .tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            map.contains_key(model_id)
+        };
+        if has_general_tok {
+            return Ok(user_prompt.to_owned());
         }
 
         Err(ManagerError::ModelNotFound(model_id.to_owned()))
@@ -255,60 +276,72 @@ impl PromptOrchestrator {
         model_id: &str,
         req: &PromptPreparationRequest<'_>,
     ) -> Result<PreparedPrompt, ManagerError> {
-        let custom_template = self
-            .templates
-            .read()
-            .ok()
-            .and_then(|tmap| tmap.get(model_id).cloned());
+        let custom_template = {
+            let map = self
+                .templates
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            map.get(model_id).cloned()
+        };
 
         // 1. Check GgufTokenizer
-        if let Ok(map) = self.gguf_tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                let default_tmpl = tok.chat_template().clone();
-                let tmpl = custom_template.as_ref().unwrap_or(&default_tmpl);
-                let formatted_text = if req.apply_chat_template {
-                    tmpl.format_prompt(req.prompt)
-                } else {
-                    req.prompt.to_owned()
-                };
-                let token_ids = tok.encode(&formatted_text)?;
-                if req.n_ctx == 0 || token_ids.len() >= req.n_ctx {
-                    return Err(ManagerError::from(K3Error::ContextLengthExceeded {
-                        requested_tokens: token_ids.len(),
-                        max_context_tokens: req.n_ctx,
-                    }));
-                }
-                return Ok(PreparedPrompt {
-                    formatted_text,
-                    token_ids,
-                });
+        let gguf_tok = {
+            let map = self
+                .gguf_tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            map.get(model_id).cloned()
+        };
+        if let Some(tok) = gguf_tok {
+            let default_tmpl = tok.chat_template().clone();
+            let tmpl = custom_template.as_ref().unwrap_or(&default_tmpl);
+            let formatted_text = if req.apply_chat_template {
+                tmpl.format_prompt(req.prompt)
+            } else {
+                req.prompt.to_owned()
+            };
+            let token_ids = tok.encode(&formatted_text)?;
+            if req.n_ctx == 0 || token_ids.len() >= req.n_ctx {
+                return Err(ManagerError::from(K3Error::ContextLengthExceeded {
+                    requested_tokens: token_ids.len(),
+                    max_context_tokens: req.n_ctx,
+                }));
             }
+            return Ok(PreparedPrompt {
+                formatted_text,
+                token_ids,
+            });
         }
 
         // 2. Check general Tokenizer
-        if let Ok(map) = self.tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                let formatted_text = if req.apply_chat_template {
-                    if let Some(ref tmpl) = custom_template {
-                        tmpl.format_prompt(req.prompt)
-                    } else {
-                        req.prompt.to_owned()
-                    }
+        let gen_tok = {
+            let map = self
+                .tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            map.get(model_id).cloned()
+        };
+        if let Some(tok) = gen_tok {
+            let formatted_text = if req.apply_chat_template {
+                if let Some(ref tmpl) = custom_template {
+                    tmpl.format_prompt(req.prompt)
                 } else {
                     req.prompt.to_owned()
-                };
-                let token_ids = tok.encode(&formatted_text)?;
-                if req.n_ctx == 0 || token_ids.len() >= req.n_ctx {
-                    return Err(ManagerError::from(K3Error::ContextLengthExceeded {
-                        requested_tokens: token_ids.len(),
-                        max_context_tokens: req.n_ctx,
-                    }));
                 }
-                return Ok(PreparedPrompt {
-                    formatted_text,
-                    token_ids,
-                });
+            } else {
+                req.prompt.to_owned()
+            };
+            let token_ids = tok.encode(&formatted_text)?;
+            if req.n_ctx == 0 || token_ids.len() >= req.n_ctx {
+                return Err(ManagerError::from(K3Error::ContextLengthExceeded {
+                    requested_tokens: token_ids.len(),
+                    max_context_tokens: req.n_ctx,
+                }));
             }
+            return Ok(PreparedPrompt {
+                formatted_text,
+                token_ids,
+            });
         }
 
         Err(ManagerError::ModelNotFound(model_id.to_owned()))
@@ -338,12 +371,20 @@ impl PromptOrchestrator {
     ///
     /// Returns [`ManagerError::ModelNotFound`] if no tokenizer exists for `model_id`.
     pub fn get_tokenizer(&self, model_id: &str) -> Result<Arc<dyn Tokenizer>, ManagerError> {
-        if let Ok(map) = self.tokenizers.read() {
+        {
+            let map = self
+                .tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(tok) = map.get(model_id) {
                 return Ok(Arc::clone(tok));
             }
         }
-        if let Ok(map) = self.gguf_tokenizers.read() {
+        {
+            let map = self
+                .gguf_tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(tok) = map.get(model_id) {
                 return Ok(Arc::clone(tok) as Arc<dyn Tokenizer>);
             }
@@ -357,10 +398,12 @@ impl PromptOrchestrator {
     ///
     /// Returns [`ManagerError::ModelNotFound`] if no GGUF tokenizer exists for `model_id`.
     pub fn get_gguf_tokenizer(&self, model_id: &str) -> Result<Arc<GgufTokenizer>, ManagerError> {
-        if let Ok(map) = self.gguf_tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                return Ok(Arc::clone(tok));
-            }
+        let map = self
+            .gguf_tokenizers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(tok) = map.get(model_id) {
+            return Ok(Arc::clone(tok));
         }
         Err(ManagerError::ModelNotFound(model_id.to_owned()))
     }
@@ -371,17 +414,29 @@ impl PromptOrchestrator {
     ///
     /// Returns [`ManagerError::ModelNotFound`] if no template is registered for `model_id`.
     pub fn get_template(&self, model_id: &str) -> Result<ChatTemplate, ManagerError> {
-        if let Ok(map) = self.templates.read() {
+        {
+            let map = self
+                .templates
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(tmpl) = map.get(model_id) {
                 return Ok(tmpl.clone());
             }
         }
-        if let Ok(map) = self.gguf_tokenizers.read() {
+        {
+            let map = self
+                .gguf_tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(tok) = map.get(model_id) {
                 return Ok(tok.chat_template().clone());
             }
         }
-        if let Ok(map) = self.tokenizers.read() {
+        {
+            let map = self
+                .tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if map.contains_key(model_id) {
                 return Ok(ChatTemplate::new(None));
             }
@@ -395,12 +450,20 @@ impl PromptOrchestrator {
     ///
     /// Returns [`ManagerError::ModelNotFound`] if `model_id` is not registered.
     pub fn get_special_tokens(&self, model_id: &str) -> Result<SpecialTokens, ManagerError> {
-        if let Ok(map) = self.gguf_tokenizers.read() {
+        {
+            let map = self
+                .gguf_tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(tok) = map.get(model_id) {
                 return Ok(tok.special_tokens().clone());
             }
         }
-        if let Ok(map) = self.tokenizers.read() {
+        {
+            let map = self
+                .tokenizers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(tok) = map.get(model_id) {
                 return Ok(tok.special_tokens().clone());
             }
@@ -451,19 +514,8 @@ impl PromptOrchestrator {
     ///
     /// Returns [`ManagerError::ModelNotFound`] if `model_id` is not registered.
     pub fn is_stop_token(&self, model_id: &str, token_id: u32) -> Result<bool, ManagerError> {
-        if let Ok(map) = self.gguf_tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                return Ok(tok.special_tokens().is_stop(token_id));
-            }
-        }
-
-        if let Ok(map) = self.tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                return Ok(tok.special_tokens().is_stop(token_id));
-            }
-        }
-
-        Err(ManagerError::ModelNotFound(model_id.to_owned()))
+        let special = self.get_special_tokens(model_id)?;
+        Ok(special.is_stop(token_id))
     }
 
     /// Creates an [`IncrementalStopDetector`] bound to `model_id`'s special tokens.
@@ -475,19 +527,21 @@ impl PromptOrchestrator {
         &self,
         model_id: &str,
     ) -> Result<IncrementalStopDetector, ManagerError> {
-        if let Ok(map) = self.gguf_tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                return Ok(IncrementalStopDetector::new(tok.special_tokens().clone()));
-            }
-        }
+        let special = self.get_special_tokens(model_id)?;
+        Ok(IncrementalStopDetector::new(special))
+    }
 
-        if let Ok(map) = self.tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                return Ok(IncrementalStopDetector::new(tok.special_tokens().clone()));
-            }
-        }
-
-        Err(ManagerError::ModelNotFound(model_id.to_owned()))
+    /// Intentionally poisons internal RwLocks for adversarial fault-tolerance tests.
+    #[doc(hidden)]
+    pub fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = self
+                .templates
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.insert("__poison__".to_owned(), ChatTemplate::new(None));
+            panic!("intentional test poison");
+        }));
     }
 }
 

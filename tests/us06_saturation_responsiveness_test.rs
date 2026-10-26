@@ -239,3 +239,119 @@ fn test_scenario1_control_responsiveness_under_100_percent_compute_saturation() 
         "max control plane latency under 100% compute saturation was {max_latency}us, exceeding 50ms ceiling"
     );
 }
+
+#[test]
+fn test_scenario1_multi_client_concurrent_saturation_responsiveness() {
+    let (runtime, _) = setup_runtime();
+
+    // 1. Launch 4 compute workers running heavy forward pass loops
+    let compute_running = Arc::new(AtomicBool::new(true));
+    let forward_pass_counter = Arc::new(AtomicU64::new(0));
+
+    let mut compute_handles = Vec::new();
+    for worker_id in 0..4 {
+        let running_clone = Arc::clone(&compute_running);
+        let counter_clone = Arc::clone(&forward_pass_counter);
+
+        let handle = std::thread::Builder::new()
+            .name(format!("multi-compute-{worker_id}"))
+            .spawn(move || {
+                let mut x: u64 = 0;
+                while running_clone.load(Ordering::Relaxed) {
+                    for _ in 0..10_000 {
+                        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    }
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                }
+                x
+            })
+            .expect("spawn compute thread");
+        compute_handles.push(handle);
+    }
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(forward_pass_counter.load(Ordering::Relaxed) > 0);
+
+    // 2. Launch 4 concurrent client threads submitting simultaneous requests
+    let client_count = 4;
+    let iterations_per_client = 50;
+    let mut client_handles = Vec::new();
+
+    for client_id in 0..client_count {
+        let rt = Arc::clone(&runtime);
+        let handle = std::thread::Builder::new()
+            .name(format!("multi-client-{client_id}"))
+            .spawn(move || {
+                let mut latencies = Vec::with_capacity(iterations_per_client);
+                for i in 0..iterations_per_client {
+                    let t0 = Instant::now();
+
+                    // Format prompt
+                    let formatted = rt
+                        .format_prompt("model-saturated", "hello concurrent client")
+                        .unwrap();
+                    assert!(formatted.contains("hello concurrent client"));
+
+                    // Tokenize prompt
+                    let tokens = rt
+                        .tokenize_prompt("model-saturated", "hello world", false, 64)
+                        .unwrap();
+                    assert_eq!(tokens, vec![1001, 1002]);
+
+                    // Prefix lookup
+                    let q: Vec<u32> = (0..20).collect();
+                    let res = rt.match_prefix("project-test", "model-saturated", &q);
+                    assert_eq!(res.matched_blocks, vec![10]);
+
+                    // Stop token & sequence
+                    assert!(rt.is_stop_token("model-saturated", 2).unwrap());
+                    assert!(
+                        rt.is_stop_sequence("model-saturated", "<|im_end|>")
+                            .unwrap()
+                    );
+
+                    // Dispatched active control task
+                    if i % 10 == 0 {
+                        let ping = rt.dispatch_execute_admin(AdminCommand::Ping).unwrap();
+                        assert_eq!(ping, AdminResponse::Pong);
+                    }
+
+                    latencies.push(t0.elapsed().as_micros());
+                }
+                latencies
+            })
+            .expect("spawn client thread");
+        client_handles.push(handle);
+    }
+
+    // Await all client threads
+    let mut all_latencies = Vec::new();
+    for handle in client_handles {
+        let latencies = handle.join().expect("client thread join");
+        all_latencies.extend(latencies);
+    }
+
+    // Stop compute workers
+    compute_running.store(false, Ordering::Relaxed);
+    for handle in compute_handles {
+        let _ = handle.join();
+    }
+
+    assert!(forward_pass_counter.load(Ordering::Relaxed) > 50);
+
+    // Assert responsiveness across all 4 concurrent clients
+    let total_queries = all_latencies.len();
+    assert_eq!(total_queries, client_count * iterations_per_client);
+
+    let avg = all_latencies.iter().sum::<u128>() as f64 / total_queries as f64;
+    let max = *all_latencies.iter().max().unwrap_or(&0);
+
+    assert!(
+        avg < 5000.0,
+        "concurrent clients average latency {avg:.2}us exceeded 5ms ceiling"
+    );
+    assert!(
+        max < 50_000,
+        "concurrent clients max latency {max}us exceeded 50ms ceiling"
+    );
+}

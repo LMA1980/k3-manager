@@ -806,12 +806,18 @@ impl ControlPlaneRuntime {
                 cluster,
             } => {
                 crate::domain::validate_model_id(&model_id)?;
+                let norm_cluster = cluster.to_ascii_lowercase();
+                if norm_cluster != "x100" && norm_cluster != "a100" {
+                    return Err(ManagerError::WorkerSpawn(format!(
+                        "unsupported cluster '{cluster}'; must be 'x100' or 'a100'"
+                    )));
+                }
                 let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
                 map.insert(
                     model_id.clone(),
                     ModelPlacementRecord {
                         model_id: model_id.clone(),
-                        cluster,
+                        cluster: norm_cluster,
                         pid: None,
                         is_alive: true,
                         generation: 1,

@@ -19,7 +19,7 @@ pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [dependencies]
-k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git", branch = "main" }
+k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git" }
 k3-tokenizer = { version = "0.1.0", git = "https://github.com/LMA1980/k3-tokenizer.git" }
 arrow-array = "59.3.1"
 arrow-buffer = "59.3.1"
