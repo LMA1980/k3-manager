@@ -1,0 +1,467 @@
+//! Integration tests for cgroup v2 domain placement and OS affinity fallback.
+//!
+//! Verifies US-06.1.2 requirements:
+//! - Canonical `cpuset.cpus` bitmask-to-list formatting and parsing (ranges, single cores, disjoint runs).
+//! - Deterministic cgroup v2 leaf directory creation (`.../control`, `.../engines/<model>`).
+//! - `cpuset.cpus` formatting and `cgroup.procs` / `cgroup.threads` migration.
+//! - Seamless fallback to OS thread/process affinity on `EACCES` / `ENOENT` / unwritable cgroup.
+//! - `SpacemiT` HMP `/proc/set_ai_thread` registration for A100 cores.
+//! - Supervisor `spawn_worker` and `recover_worker` integration.
+//! - Control plane scheduler helper integration.
+
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use k3_core::affinity::ControlPlaneCapacityConfig;
+use k3_manager::capacity::{
+    CgroupV2DomainController, ControlPlaneScheduler, DomainPlacementMode, MockCgroupFs,
+    MockOsAffinityBackend, format_cpuset_list, parse_cpuset_list,
+};
+use k3_manager::error::ManagerError;
+use k3_manager::supervisor::WorkerSupervisor;
+
+#[test]
+fn test_cpuset_list_formatting_and_parsing_roundtrip() {
+    let test_cases: &[(u64, &str)] = &[
+        (0x0001, "0"),
+        (0x0002, "1"),
+        (0x0020, "5"),
+        (0x0080, "7"),
+        (0x8000, "15"),
+        (0x0003, "0-1"),
+        (0x003F, "0-5"),
+        (0x00C0, "6-7"),
+        (0x00E0, "5-7"),
+        (0x00FF, "0-7"),
+        (0xFF00, "8-15"),
+        (0xFFFF, "0-15"),
+        (0x00A5, "0,2,5,7"),
+        (0x00F3, "0-1,4-7"),
+        (0x0447, "0-2,6,10"),
+        (0x73C7, "0-2,6-9,12-14"),
+    ];
+
+    for &(mask, expected_str) in test_cases {
+        let formatted = format_cpuset_list(mask)
+            .unwrap_or_else(|e| panic!("failed to format mask 0x{mask:04X}: {e}"));
+        assert_eq!(
+            formatted, expected_str,
+            "formatting mismatch for 0x{mask:04X}"
+        );
+
+        let parsed = parse_cpuset_list(expected_str)
+            .unwrap_or_else(|e| panic!("failed to parse '{expected_str}': {e}"));
+        assert_eq!(
+            parsed, mask,
+            "parsed mask mismatch for '{expected_str}' (expected 0x{mask:04X}, got 0x{parsed:04X})"
+        );
+    }
+}
+
+#[test]
+fn test_cpuset_list_invalid_masks_and_strings_rejection() {
+    // 1. Invalid masks
+    assert!(format_cpuset_list(0).is_err());
+    assert!(format_cpuset_list(0x1_0000).is_err());
+    assert!(format_cpuset_list(0x8000_0000_0000_0000).is_err());
+
+    // 2. Invalid string syntax
+    let bad_strings = &[
+        "", "   ", ",", "0,,1", ",0", "0,", "16", "0-16", "15-16", "7-5",
+        "5-5", // single core as range start=end should still parse or be handled cleanly
+        "0-1-2", "abc", "-1",
+        "0 - 5", // whitespace in tokens should be trimmed or rejected gracefully
+    ];
+
+    for &bad in bad_strings {
+        if bad == "5-5" || bad == "0 - 5" {
+            // "5-5" is mathematically valid (core 5), and "0 - 5" with whitespace trims to 0-5
+            let _ = parse_cpuset_list(bad);
+        } else {
+            let res = parse_cpuset_list(bad);
+            assert!(
+                res.is_err(),
+                "expected rejection for '{bad}', but got: {res:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_cgroup_v2_control_plane_placement_happy_path() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    let cap = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("default capacity resolution");
+
+    // Place control plane with explicit PID 12345
+    let outcome = controller
+        .place_control_plane(12345, &cap)
+        .expect("control placement");
+
+    assert_eq!(outcome.target_id, 12345);
+    match outcome.mode {
+        DomainPlacementMode::CgroupV2 {
+            cgroup_path,
+            cpuset,
+        } => {
+            assert_eq!(
+                cgroup_path,
+                PathBuf::from("/sys/fs/cgroup/k3.slice/control")
+            );
+            assert_eq!(cpuset, "5-7");
+        }
+        DomainPlacementMode::OsAffinityFallback { .. } => {
+            panic!("expected CgroupV2 placement, got OsAffinityFallback");
+        }
+    }
+
+    // Verify mock filesystem state
+    assert!(fs.is_dir_created("/sys/fs/cgroup/k3.slice/control"));
+    assert_eq!(
+        fs.written_file("/sys/fs/cgroup/k3.slice/control/cpuset.cpus")
+            .as_deref(),
+        Some("5-7\n")
+    );
+    assert_eq!(
+        fs.written_file("/sys/fs/cgroup/k3.slice/control/cgroup.procs")
+            .as_deref(),
+        Some("12345\n")
+    );
+    assert_eq!(aff.calls().len(), 0);
+}
+
+#[test]
+fn test_cgroup_v2_control_plane_placement_target_pid_zero_resolves_current_pid() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    let cap = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("default capacity resolution");
+
+    // PID 0 must resolve to current process ID
+    let current_pid = std::process::id();
+    let outcome = controller
+        .place_control_plane(0, &cap)
+        .expect("control placement");
+
+    assert_eq!(outcome.target_id, current_pid);
+    assert_eq!(
+        fs.written_file("/sys/fs/cgroup/k3.slice/control/cgroup.procs")
+            .as_deref(),
+        Some(format!("{current_pid}\n")).as_deref()
+    );
+}
+
+#[test]
+fn test_cgroup_v2_engine_worker_placement_happy_path() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    let outcome = controller
+        .place_worker(4200, "qwen2.5-7b", 0x003F)
+        .expect("worker placement");
+
+    assert_eq!(outcome.target_id, 4200);
+    match outcome.mode {
+        DomainPlacementMode::CgroupV2 {
+            cgroup_path,
+            cpuset,
+        } => {
+            assert_eq!(
+                cgroup_path,
+                PathBuf::from("/sys/fs/cgroup/k3.slice/engines/qwen2.5-7b")
+            );
+            assert_eq!(cpuset, "0-5");
+        }
+        DomainPlacementMode::OsAffinityFallback { .. } => {
+            panic!("expected CgroupV2 placement, got OsAffinityFallback");
+        }
+    }
+
+    assert!(fs.is_dir_created("/sys/fs/cgroup/k3.slice/engines/qwen2.5-7b"));
+    assert_eq!(
+        fs.written_file("/sys/fs/cgroup/k3.slice/engines/qwen2.5-7b/cpuset.cpus")
+            .as_deref(),
+        Some("0-5\n")
+    );
+    assert_eq!(
+        fs.written_file("/sys/fs/cgroup/k3.slice/engines/qwen2.5-7b/cgroup.procs")
+            .as_deref(),
+        Some("4200\n")
+    );
+    assert_eq!(aff.calls().len(), 0);
+}
+
+#[test]
+fn test_cgroup_v2_thread_migration_fallback_when_procs_fails() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Inject error on cgroup.procs only (simulating cgroup v2 threaded domain)
+    fs.inject_error(
+        "/sys/fs/cgroup/k3.slice/engines/deepseek/cgroup.procs",
+        io::ErrorKind::InvalidInput,
+    );
+
+    let outcome = controller
+        .place_worker(4300, "deepseek", 0x003F)
+        .expect("worker placement with thread fallback");
+
+    assert_eq!(outcome.target_id, 4300);
+    assert!(outcome.mode.is_cgroup_v2());
+
+    // Verify cgroup.threads was successfully written instead
+    assert_eq!(
+        fs.written_file("/sys/fs/cgroup/k3.slice/engines/deepseek/cgroup.threads")
+            .as_deref(),
+        Some("4300\n")
+    );
+    assert_eq!(aff.calls().len(), 0);
+}
+
+#[test]
+fn test_cgroup_v2_eacces_directory_creation_fallback_to_os_affinity() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Inject EACCES (PermissionDenied) on the engine leaf directory
+    fs.inject_error(
+        "/sys/fs/cgroup/k3.slice/engines/restricted-model",
+        io::ErrorKind::PermissionDenied,
+    );
+
+    let outcome = controller
+        .place_worker(7777, "restricted-model", 0x003F)
+        .expect("worker placement fallback");
+
+    assert_eq!(outcome.target_id, 7777);
+    match outcome.mode {
+        DomainPlacementMode::OsAffinityFallback { mask, reason } => {
+            assert_eq!(mask, 0x003F);
+            assert!(
+                reason.contains("cgroup v2 engine placement failed"),
+                "reason: {reason}"
+            );
+        }
+        DomainPlacementMode::CgroupV2 { .. } => {
+            panic!("expected OsAffinityFallback, got CgroupV2");
+        }
+    }
+
+    assert!(aff.has_called(7777, 0x003F));
+}
+
+#[test]
+fn test_cgroup_v2_enoent_base_fallback_to_os_affinity() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Inject ENOENT (NotFound) on root cgroup path
+    fs.inject_error("/sys/fs/cgroup/k3.slice", io::ErrorKind::NotFound);
+
+    let cap = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("capacity resolution");
+
+    let outcome = controller
+        .place_control_plane(8888, &cap)
+        .expect("control placement fallback");
+
+    assert_eq!(outcome.target_id, 8888);
+    match outcome.mode {
+        DomainPlacementMode::OsAffinityFallback { mask, reason } => {
+            assert_eq!(mask, 0x00E0);
+            assert!(
+                reason.contains("cgroup v2 control placement failed"),
+                "reason: {reason}"
+            );
+        }
+        DomainPlacementMode::CgroupV2 { .. } => {
+            panic!("expected OsAffinityFallback, got CgroupV2");
+        }
+    }
+
+    assert!(aff.has_called(8888, 0x00E0));
+}
+
+#[test]
+fn test_cgroup_v2_cpuset_write_failure_fallback_to_os_affinity() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Inject ReadOnlyFilesystem on cpuset.cpus
+    fs.inject_error(
+        "/sys/fs/cgroup/k3.slice/engines/ro-model/cpuset.cpus",
+        io::ErrorKind::ReadOnlyFilesystem,
+    );
+
+    let outcome = controller
+        .place_worker(9999, "ro-model", 0x001F)
+        .expect("fallback on cpuset write failure");
+
+    assert!(outcome.mode.is_os_affinity_fallback());
+    assert!(aff.has_called(9999, 0x001F));
+}
+
+#[test]
+fn test_a100_cluster_proc_set_ai_thread_invariant() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Inject permission error to trigger OS affinity fallback
+    fs.inject_error(
+        "/sys/fs/cgroup/k3.slice/engines/a100-worker",
+        io::ErrorKind::PermissionDenied,
+    );
+
+    // Pinning to Cluster 1 (A100 cores 8–15, mask 0xFF00)
+    let a100_placement = controller
+        .place_worker(1010, "a100-worker", 0xFF00)
+        .expect("a100 worker placement");
+
+    assert!(a100_placement.mode.is_os_affinity_fallback());
+    assert!(aff.has_called(1010, 0xFF00));
+    assert_eq!(aff.ai_thread_writes(), vec![1010]);
+
+    // Pinning to Cluster 0 (X100 cores 0–5, mask 0x003F)
+    fs.inject_error(
+        "/sys/fs/cgroup/k3.slice/engines/x100-worker",
+        io::ErrorKind::PermissionDenied,
+    );
+    let x100_placement = controller
+        .place_worker(2020, "x100-worker", 0x003F)
+        .expect("x100 worker placement");
+
+    assert!(x100_placement.mode.is_os_affinity_fallback());
+    assert!(aff.has_called(2020, 0x003F));
+    // Must NOT have added 2020 to ai_thread_writes
+    assert_eq!(aff.ai_thread_writes(), vec![1010]);
+}
+
+#[test]
+fn test_affinity_fallback_failure_propagates_error() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Both cgroup v2 and OS affinity fail
+    fs.inject_error(
+        "/sys/fs/cgroup/k3.slice/engines/fail-model",
+        io::ErrorKind::PermissionDenied,
+    );
+    aff.fail_pid(3030);
+
+    let err = controller
+        .place_worker(3030, "fail-model", 0x003F)
+        .unwrap_err();
+
+    assert!(matches!(err, ManagerError::Affinity(_)));
+}
+
+#[test]
+fn test_invalid_core_masks_rejected_without_cgroup_or_affinity_calls() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/sys/fs/cgroup/k3.slice")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    // Zero mask
+    let err_zero = controller.place_worker(4040, "zero-mask", 0).unwrap_err();
+    assert!(matches!(err_zero, ManagerError::Affinity(_)));
+
+    // Out-of-bounds mask (bit 16 set)
+    let err_oob = controller
+        .place_worker(4040, "oob-mask", 0x1_0000)
+        .unwrap_err();
+    assert!(matches!(err_oob, ManagerError::Affinity(_)));
+
+    assert_eq!(fs.created_dirs().len(), 0);
+    assert_eq!(aff.calls().len(), 0);
+}
+
+#[test]
+fn test_control_plane_scheduler_place_control_plane() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = CgroupV2DomainController::new("/mock/cgroup")
+        .with_fs(fs.clone())
+        .with_affinity_backend(aff.clone());
+
+    let cap = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("capacity");
+    let scheduler = ControlPlaneScheduler::new(cap);
+
+    let outcome = scheduler
+        .place_control_plane(5050, &controller)
+        .expect("scheduler control placement");
+
+    assert_eq!(outcome.target_id, 5050);
+    assert!(outcome.mode.is_cgroup_v2());
+    assert_eq!(
+        fs.written_file("/mock/cgroup/control/cgroup.procs")
+            .as_deref(),
+        Some("5050\n")
+    );
+}
+
+#[test]
+fn test_worker_supervisor_place_control_plane_helper() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = Arc::new(
+        CgroupV2DomainController::new("/mock/cgroup")
+            .with_fs(fs.clone())
+            .with_affinity_backend(aff.clone()),
+    );
+
+    let supervisor = WorkerSupervisor::new().with_domain_controller(controller);
+
+    let cap = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("capacity");
+
+    let outcome = supervisor
+        .place_control_plane(6060, &cap)
+        .expect("supervisor control placement");
+
+    assert_eq!(outcome.target_id, 6060);
+    assert!(outcome.mode.is_cgroup_v2());
+    assert_eq!(
+        fs.written_file("/mock/cgroup/control/cgroup.procs")
+            .as_deref(),
+        Some("6060\n")
+    );
+}

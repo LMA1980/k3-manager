@@ -18,6 +18,12 @@ use k3_core::K3Error;
 use crate::error::ManagerError;
 use crate::supervisor::WorkerPlacement;
 
+pub use crate::domain::{
+    CgroupFs, CgroupV2DomainController, DomainPlacementMode, IsolationDomainController,
+    MockCgroupFs, MockOsAffinityBackend, OsAffinityBackend, PlacementOutcome, RealCgroupFs,
+    RealOsAffinityBackend, format_cpuset_list, parse_cpuset_list, resolve_worker_compute_mask,
+};
+
 /// Extension trait providing manager-specific placement validation on [`ResolvedControlCapacity`].
 pub trait ResolvedControlCapacityExt {
     /// Validates a worker placement compute affinity mask against the resolved capacity.
@@ -40,6 +46,10 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
                 u64::from_str_radix(hex_str, 16).map_err(|e| {
                     ManagerError::WorkerSpawn(format!("invalid hex affinity '{aff_str}': {e}"))
                 })?
+            } else if let Ok(val) = aff_str.parse::<u64>() {
+                val
+            } else if let Ok(val) = parse_cpuset_list(aff_str) {
+                val
             } else {
                 aff_str.parse::<u64>().map_err(|e| {
                     ManagerError::WorkerSpawn(format!("invalid integer affinity '{aff_str}': {e}"))
@@ -118,5 +128,20 @@ impl ControlPlaneScheduler {
         placement: &WorkerPlacement,
     ) -> Result<(), ManagerError> {
         self.capacity.validate_worker_placement(placement)
+    }
+
+    /// Places the control plane into its isolated cgroup v2 domain (`.../control`) or OS affinity fallback.
+    ///
+    /// If `target_pid` is 0, targets the current process ID (`std::process::id()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if domain placement fails.
+    pub fn place_control_plane(
+        &self,
+        target_pid: u32,
+        controller: &dyn IsolationDomainController,
+    ) -> Result<PlacementOutcome, ManagerError> {
+        controller.place_control_plane(target_pid, &self.capacity)
     }
 }
