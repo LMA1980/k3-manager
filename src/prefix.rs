@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Instant;
 
 /// Number of token IDs per KV cache paged block (ADR-004, `features/kv-cache.md`).
 pub const BLOCK_SIZE_TOKENS: usize = 16;
 
 /// 16-token array representation of a single KV cache block.
 pub type BlockTokens = [u32; BLOCK_SIZE_TOKENS];
+
+static GLOBAL_ACCESS_TICK: AtomicU64 = AtomicU64::new(1);
 
 /// Longest-prefix match result returning cached physical block IDs and uncached suffix tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +52,7 @@ impl PrefixMatchResult {
 pub struct PrefixCacheStats {
     /// Number of distinct projects currently holding entries in the index.
     pub total_projects: usize,
-    /// Number of distinct (project, model) trees currently registered.
+    /// Number of distinct models currently registered.
     pub total_models: usize,
     /// Total number of 16-token KV cache blocks indexed across all models.
     pub total_cached_blocks: usize,
@@ -79,7 +80,7 @@ impl PrefixCacheStats {
 #[derive(Debug)]
 struct RadixTreeNode {
     block_id: u32,
-    last_accessed: Instant,
+    last_accessed_tick: AtomicU64,
     children: HashMap<BlockTokens, Box<RadixTreeNode>>,
 }
 
@@ -87,7 +88,7 @@ impl RadixTreeNode {
     fn new(block_id: u32) -> Self {
         Self {
             block_id,
-            last_accessed: Instant::now(),
+            last_accessed_tick: AtomicU64::new(GLOBAL_ACCESS_TICK.fetch_add(1, Ordering::Relaxed)),
             children: HashMap::new(),
         }
     }
@@ -119,6 +120,10 @@ impl ModelPrefixTree {
             chunk.copy_from_slice(&token_ids[offset..offset + BLOCK_SIZE_TOKENS]);
 
             if let Some(child) = curr_children.get(&chunk) {
+                child.last_accessed_tick.store(
+                    GLOBAL_ACCESS_TICK.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
                 matched_blocks.push(child.block_id);
                 curr_children = &child.children;
             } else {
@@ -157,7 +162,10 @@ impl ModelPrefixTree {
             });
 
             entry.block_id = target_block_id;
-            entry.last_accessed = Instant::now();
+            entry.last_accessed_tick.store(
+                GLOBAL_ACCESS_TICK.fetch_add(1, Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             curr_children = &mut entry.children;
         }
 
@@ -198,11 +206,14 @@ impl ModelPrefixTree {
 
     fn collect_leaves(
         children: &HashMap<BlockTokens, Box<RadixTreeNode>>,
-        leaves: &mut Vec<(Instant, u32)>,
+        leaves: &mut Vec<(u64, u32)>,
     ) {
         for node in children.values() {
             if node.children.is_empty() {
-                leaves.push((node.last_accessed, node.block_id));
+                leaves.push((
+                    node.last_accessed_tick.load(Ordering::Relaxed),
+                    node.block_id,
+                ));
             } else {
                 Self::collect_leaves(&node.children, leaves);
             }
@@ -210,14 +221,27 @@ impl ModelPrefixTree {
     }
 
     fn evict_lru(&mut self, max_blocks: usize) -> Vec<u32> {
-        let mut leaves = Vec::new();
-        Self::collect_leaves(&self.root_children, &mut leaves);
-        leaves.sort_by_key(|(t, _)| *t);
-
         let mut evicted = Vec::new();
-        for (_, block_id) in leaves.into_iter().take(max_blocks) {
-            if self.invalidate_block(block_id) {
-                evicted.push(block_id);
+        while evicted.len() < max_blocks {
+            let mut leaves = Vec::new();
+            Self::collect_leaves(&self.root_children, &mut leaves);
+            if leaves.is_empty() {
+                break;
+            }
+            leaves.sort_by_key(|(tick, _)| *tick);
+
+            let mut progress = false;
+            for (_, block_id) in leaves {
+                if self.invalidate_block(block_id) {
+                    evicted.push(block_id);
+                    progress = true;
+                    if evicted.len() >= max_blocks {
+                        break;
+                    }
+                }
+            }
+            if !progress {
+                break;
             }
         }
         evicted
@@ -293,6 +317,12 @@ impl PrefixRadixIndex {
     ) -> usize {
         let key = (project_id.to_owned(), model_id.to_owned());
         let tree_arc = {
+            let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
+            map.get(&key).cloned()
+        };
+        let tree_arc = if let Some(arc) = tree_arc {
+            arc
+        } else {
             let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
             map.entry(key)
                 .or_insert_with(|| Arc::new(RwLock::new(ModelPrefixTree::default())))
@@ -319,6 +349,24 @@ impl PrefixRadixIndex {
         } else {
             0
         }
+    }
+
+    /// Invalidates all cached prefix blocks for a model across all registered projects.
+    ///
+    /// Returns the total number of blocks invalidated.
+    pub fn invalidate_model_all_projects(&self, model_id: &str) -> usize {
+        let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
+        let keys_to_remove: Vec<(String, String)> =
+            map.keys().filter(|(_, m)| m == model_id).cloned().collect();
+
+        let mut total_invalidated = 0;
+        for k in keys_to_remove {
+            if let Some(tree) = map.remove(&k) {
+                let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
+                total_invalidated += guard.total_blocks;
+            }
+        }
+        total_invalidated
     }
 
     /// Invalidates all cached prefix blocks across all models for a specific project.
@@ -383,10 +431,12 @@ impl PrefixRadixIndex {
     pub fn stats(&self) -> PrefixCacheStats {
         let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
         let mut projects = std::collections::HashSet::new();
+        let mut models = std::collections::HashSet::new();
         let mut total_blocks = 0;
 
-        for ((proj, _), tree) in map.iter() {
+        for ((proj, model), tree) in map.iter() {
             projects.insert(proj.clone());
+            models.insert(model.clone());
             if let Ok(guard) = tree.read() {
                 total_blocks += guard.total_blocks;
             }
@@ -394,7 +444,7 @@ impl PrefixRadixIndex {
 
         PrefixCacheStats {
             total_projects: projects.len(),
-            total_models: map.len(),
+            total_models: models.len(),
             total_cached_blocks: total_blocks,
             lookup_count: self.lookup_count.load(Ordering::Relaxed),
             hit_count: self.hit_count.load(Ordering::Relaxed),

@@ -8,7 +8,8 @@
 #![allow(
     clippy::assert_is_empty,
     clippy::missing_panics_doc,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
 )]
 
 use std::sync::Arc;
@@ -165,6 +166,20 @@ fn test_scenario1_control_responsiveness_under_100_percent_compute_saturation() 
                 .execute_admin(AdminCommand::GetPrefixCacheStats)
                 .expect("admin cache stats");
             assert!(matches!(stats, AdminResponse::PrefixCacheStats(_)));
+        }
+
+        // Operation H: Dispatched active control thread execution under saturation (ADR-007)
+        if i % 20 == 0 {
+            let dispatched_tokens = runtime
+                .dispatch_tokenize_prompt("model-saturated", "hello world", false, 128)
+                .expect("dispatch tokenize prompt");
+            assert_eq!(dispatched_tokens, vec![1001, 1002]);
+
+            let q_tokens: Vec<u32> = (0..20).collect();
+            let dispatched_match = runtime
+                .dispatch_match_prefix("project-test", "model-saturated", q_tokens)
+                .expect("dispatch match prefix");
+            assert_eq!(dispatched_match.matched_blocks, vec![10]);
         }
 
         let elapsed = t0.elapsed();

@@ -19,7 +19,8 @@ use crate::domain::{OsAffinityBackend, RealOsAffinityBackend};
 use crate::error::ManagerError;
 use crate::prefix::{PrefixCacheStats, PrefixMatchResult, PrefixRadixIndex};
 use crate::prompt::{
-    ChatTemplate, GgufTokenizer, IncrementalStopDetector, PromptOrchestrator, Tokenizer,
+    ChatTemplate, GgufTokenizer, IncrementalStopDetector, PreparedPrompt, PromptOrchestrator,
+    PromptPreparationRequest, Tokenizer,
 };
 use k3_core::affinity::ResolvedControlCapacity;
 
@@ -278,8 +279,8 @@ impl ControlPlaneRuntime {
 
         let (resp_tx, resp_rx) = sync_channel(1);
         let boxed_task = Box::new(move |core: usize| {
-            let res = f(core);
-            let _ = resp_tx.send(res);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(core)));
+            let _ = resp_tx.send(outcome);
         });
 
         worker
@@ -287,8 +288,88 @@ impl ControlPlaneRuntime {
             .send(boxed_task)
             .map_err(|_| ManagerError::WorkerIpc("control worker thread is dead".to_owned()))?;
 
-        resp_rx.recv().map_err(|_| {
+        let outcome = resp_rx.recv().map_err(|_| {
             ManagerError::WorkerIpc("control worker thread failed to respond".to_owned())
+        })?;
+
+        outcome.map_err(|_| {
+            ManagerError::WorkerIpc("control-plane task panicked during execution".to_owned())
+        })
+    }
+
+    /// Dispatches prompt formatting to execute on a dedicated active control thread (ADR-007).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if formatting or worker thread dispatch fails.
+    pub fn dispatch_format_prompt(
+        &self,
+        model_id: impl Into<String>,
+        user_prompt: impl Into<String>,
+    ) -> Result<String, ManagerError> {
+        let m_id = model_id.into();
+        let prompt = user_prompt.into();
+        let orchestrator = Arc::clone(&self.prompt_orchestrator);
+        self.dispatch_control_task(move |_| orchestrator.format_prompt(&m_id, &prompt))?
+    }
+
+    /// Dispatches prompt tokenization to execute on a dedicated active control thread (ADR-007).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if tokenization or worker thread dispatch fails.
+    pub fn dispatch_tokenize_prompt(
+        &self,
+        model_id: impl Into<String>,
+        prompt: impl Into<String>,
+        apply_template: bool,
+        n_ctx: usize,
+    ) -> Result<Vec<u32>, ManagerError> {
+        let m_id = model_id.into();
+        let p_text = prompt.into();
+        let orchestrator = Arc::clone(&self.prompt_orchestrator);
+        self.dispatch_control_task(move |_| {
+            orchestrator.tokenize_prompt(&m_id, &p_text, apply_template, n_ctx)
+        })?
+    }
+
+    /// Dispatches prompt preparation (formatting + tokenization + admission) to a dedicated active control thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if preparation or worker thread dispatch fails.
+    pub fn dispatch_prepare_prompt(
+        &self,
+        model_id: impl Into<String>,
+        prompt: impl Into<String>,
+        apply_template: bool,
+        n_ctx: usize,
+    ) -> Result<PreparedPrompt, ManagerError> {
+        let m_id = model_id.into();
+        let p_text = prompt.into();
+        let orchestrator = Arc::clone(&self.prompt_orchestrator);
+        self.dispatch_control_task(move |_| {
+            let req = PromptPreparationRequest::new(&p_text, apply_template, n_ctx);
+            orchestrator.prepare_prompt(&m_id, &req)
+        })?
+    }
+
+    /// Dispatches prefix radix matching to execute on a dedicated active control thread (ADR-007).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if worker thread dispatch fails.
+    pub fn dispatch_match_prefix(
+        &self,
+        project_id: impl Into<String>,
+        model_id: impl Into<String>,
+        token_ids: Vec<u32>,
+    ) -> Result<PrefixMatchResult, ManagerError> {
+        let p_id = project_id.into();
+        let m_id = model_id.into();
+        let prefix_index = Arc::clone(&self.prefix_index);
+        self.dispatch_control_task(move |_| {
+            prefix_index.match_longest_prefix(&p_id, &m_id, &token_ids)
         })
     }
 
@@ -328,6 +409,19 @@ impl ControlPlaneRuntime {
             .format_prompt(model_id, user_prompt)
     }
 
+    /// Prepares, formats, tokenizes, and validates a prompt for context window admission bounds (ADR-027).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if model not found or `n_ctx` is exceeded.
+    pub fn prepare_prompt(
+        &self,
+        model_id: &str,
+        req: &PromptPreparationRequest<'_>,
+    ) -> Result<PreparedPrompt, ManagerError> {
+        self.prompt_orchestrator.prepare_prompt(model_id, req)
+    }
+
     /// Prepares, tokenizes, and validates a prompt for context window admission bounds (ADR-027).
     ///
     /// # Errors
@@ -342,6 +436,55 @@ impl ControlPlaneRuntime {
     ) -> Result<Vec<u32>, ManagerError> {
         self.prompt_orchestrator
             .tokenize_prompt(model_id, prompt, apply_template, n_ctx)
+    }
+
+    /// Retrieves the registered general [`Tokenizer`] for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if no tokenizer exists for `model_id`.
+    pub fn get_tokenizer(&self, model_id: &str) -> Result<Arc<dyn Tokenizer>, ManagerError> {
+        self.prompt_orchestrator.get_tokenizer(model_id)
+    }
+
+    /// Retrieves the registered [`GgufTokenizer`] for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if no GGUF tokenizer exists for `model_id`.
+    pub fn get_gguf_tokenizer(&self, model_id: &str) -> Result<Arc<GgufTokenizer>, ManagerError> {
+        self.prompt_orchestrator.get_gguf_tokenizer(model_id)
+    }
+
+    /// Retrieves the active [`ChatTemplate`] for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if no template exists for `model_id`.
+    pub fn get_template(&self, model_id: &str) -> Result<ChatTemplate, ManagerError> {
+        self.prompt_orchestrator.get_template(model_id)
+    }
+
+    /// Decodes a sequence of token IDs into text using `model_id`'s tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if decoding fails or model is not found.
+    pub fn decode(&self, model_id: &str, tokens: &[u32]) -> Result<String, ManagerError> {
+        self.prompt_orchestrator.decode(model_id, tokens)
+    }
+
+    /// Decodes a single token ID into a piece using `model_id`'s tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if piece decoding fails or model is not found.
+    pub fn decode_piece(
+        &self,
+        model_id: &str,
+        token_id: u32,
+    ) -> Result<Option<String>, ManagerError> {
+        self.prompt_orchestrator.decode_piece(model_id, token_id)
     }
 
     /// Checks if `token_id` is a stop token for `model_id`.
@@ -544,20 +687,7 @@ impl ControlPlaneRuntime {
                 let cleared = match (project_id, model_id) {
                     (Some(p), Some(m)) => self.invalidate_prefix_model(&p, &m),
                     (Some(p), None) => self.invalidate_prefix_project(&p),
-                    (None, Some(m)) => {
-                        let mut total = 0;
-                        let projects: Vec<String> = {
-                            let map = self
-                                .placements
-                                .read()
-                                .unwrap_or_else(PoisonError::into_inner);
-                            map.keys().cloned().collect()
-                        };
-                        for p in projects {
-                            total += self.invalidate_prefix_model(&p, &m);
-                        }
-                        total
-                    }
+                    (None, Some(m)) => self.prefix_index.invalidate_model_all_projects(&m),
                     (None, None) => {
                         let stats = self.prefix_cache_stats();
                         self.prefix_index.clear();

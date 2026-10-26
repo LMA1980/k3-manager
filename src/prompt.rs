@@ -219,6 +219,78 @@ impl PromptOrchestrator {
         Err(ManagerError::ModelNotFound(model_id.to_owned()))
     }
 
+    /// Prepares, formats, tokenizes, and validates a prompt for context window admission (ADR-027).
+    ///
+    /// Evaluates custom registered chat templates first before falling back to tokenizer metadata templates.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`ManagerError::ModelNotFound`] if no tokenizer is registered for `model_id`.
+    /// - Returns [`ManagerError::TensorBounds`] if `n_ctx` is exceeded or encoding fails.
+    pub fn prepare_prompt(
+        &self,
+        model_id: &str,
+        req: &PromptPreparationRequest<'_>,
+    ) -> Result<PreparedPrompt, ManagerError> {
+        let custom_template = self
+            .templates
+            .read()
+            .ok()
+            .and_then(|tmap| tmap.get(model_id).cloned());
+
+        // 1. Check GgufTokenizer
+        if let Ok(map) = self.gguf_tokenizers.read() {
+            if let Some(tok) = map.get(model_id) {
+                let default_tmpl = tok.chat_template().clone();
+                let tmpl = custom_template.as_ref().unwrap_or(&default_tmpl);
+                let formatted_text = if req.apply_chat_template {
+                    tmpl.format_prompt(req.prompt)
+                } else {
+                    req.prompt.to_owned()
+                };
+                let token_ids = tok.encode(&formatted_text)?;
+                if req.n_ctx == 0 || token_ids.len() >= req.n_ctx {
+                    return Err(ManagerError::from(K3Error::ContextLengthExceeded {
+                        requested_tokens: token_ids.len(),
+                        max_context_tokens: req.n_ctx,
+                    }));
+                }
+                return Ok(PreparedPrompt {
+                    formatted_text,
+                    token_ids,
+                });
+            }
+        }
+
+        // 2. Check general Tokenizer
+        if let Ok(map) = self.tokenizers.read() {
+            if let Some(tok) = map.get(model_id) {
+                let formatted_text = if req.apply_chat_template {
+                    if let Some(ref tmpl) = custom_template {
+                        tmpl.format_prompt(req.prompt)
+                    } else {
+                        req.prompt.to_owned()
+                    }
+                } else {
+                    req.prompt.to_owned()
+                };
+                let token_ids = tok.encode(&formatted_text)?;
+                if req.n_ctx == 0 || token_ids.len() >= req.n_ctx {
+                    return Err(ManagerError::from(K3Error::ContextLengthExceeded {
+                        requested_tokens: token_ids.len(),
+                        max_context_tokens: req.n_ctx,
+                    }));
+                }
+                return Ok(PreparedPrompt {
+                    formatted_text,
+                    token_ids,
+                });
+            }
+        }
+
+        Err(ManagerError::ModelNotFound(model_id.to_owned()))
+    }
+
     /// Prepares, tokenizes, and validates a prompt for context window admission (ADR-027).
     ///
     /// # Errors
@@ -232,35 +304,85 @@ impl PromptOrchestrator {
         apply_template: bool,
         n_ctx: usize,
     ) -> Result<Vec<u32>, ManagerError> {
-        // Check GgufTokenizer first
-        if let Ok(map) = self.gguf_tokenizers.read() {
-            if let Some(tok) = map.get(model_id) {
-                return tok
-                    .tokenize_prompt(prompt, apply_template, n_ctx)
-                    .map_err(ManagerError::from);
-            }
-        }
+        let req = PromptPreparationRequest::new(prompt, apply_template, n_ctx);
+        self.prepare_prompt(model_id, &req)
+            .map(|prep| prep.token_ids)
+    }
 
-        // Check generic Tokenizer
+    /// Retrieves the registered general [`Tokenizer`] for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if no tokenizer exists for `model_id`.
+    pub fn get_tokenizer(&self, model_id: &str) -> Result<Arc<dyn Tokenizer>, ManagerError> {
         if let Ok(map) = self.tokenizers.read() {
             if let Some(tok) = map.get(model_id) {
-                let template = self
-                    .templates
-                    .read()
-                    .ok()
-                    .and_then(|tmap| tmap.get(model_id).cloned());
-                return validate_and_tokenize(
-                    tok.as_ref(),
-                    prompt,
-                    template.as_ref(),
-                    apply_template,
-                    n_ctx,
-                )
-                .map_err(ManagerError::from);
+                return Ok(Arc::clone(tok));
             }
         }
-
+        if let Ok(map) = self.gguf_tokenizers.read() {
+            if let Some(tok) = map.get(model_id) {
+                return Ok(Arc::clone(tok) as Arc<dyn Tokenizer>);
+            }
+        }
         Err(ManagerError::ModelNotFound(model_id.to_owned()))
+    }
+
+    /// Retrieves the registered [`GgufTokenizer`] for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if no GGUF tokenizer exists for `model_id`.
+    pub fn get_gguf_tokenizer(&self, model_id: &str) -> Result<Arc<GgufTokenizer>, ManagerError> {
+        if let Ok(map) = self.gguf_tokenizers.read() {
+            if let Some(tok) = map.get(model_id) {
+                return Ok(Arc::clone(tok));
+            }
+        }
+        Err(ManagerError::ModelNotFound(model_id.to_owned()))
+    }
+
+    /// Retrieves the active [`ChatTemplate`] for `model_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError::ModelNotFound`] if no template is registered for `model_id`.
+    pub fn get_template(&self, model_id: &str) -> Result<ChatTemplate, ManagerError> {
+        if let Ok(map) = self.templates.read() {
+            if let Some(tmpl) = map.get(model_id) {
+                return Ok(tmpl.clone());
+            }
+        }
+        if let Ok(map) = self.gguf_tokenizers.read() {
+            if let Some(tok) = map.get(model_id) {
+                return Ok(tok.chat_template().clone());
+            }
+        }
+        Err(ManagerError::ModelNotFound(model_id.to_owned()))
+    }
+
+    /// Decodes a sequence of token IDs into text using `model_id`'s tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if decoding fails or model is not found.
+    pub fn decode(&self, model_id: &str, tokens: &[u32]) -> Result<String, ManagerError> {
+        let tok = self.get_tokenizer(model_id)?;
+        tok.decode(tokens).map_err(ManagerError::from)
+    }
+
+    /// Decodes a single token ID into a piece using `model_id`'s tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if piece decoding fails or model is not found.
+    pub fn decode_piece(
+        &self,
+        model_id: &str,
+        token_id: u32,
+    ) -> Result<Option<String>, ManagerError> {
+        let tok = self.get_tokenizer(model_id)?;
+        tok.decode_piece(token_id).map_err(ManagerError::from)
     }
 
     /// Checks if `token_id` is a stop token for `model_id`.

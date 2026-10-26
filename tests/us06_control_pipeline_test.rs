@@ -14,8 +14,8 @@ use k3_core::affinity::ControlPlaneCapacityConfig;
 use k3_manager::domain::MockOsAffinityBackend;
 use k3_manager::{
     AdminCommand, AdminResponse, ChatTemplate, ControlPlaneRuntime, IncrementalStopDetector,
-    PrefixRadixIndex, SimpleTokenizer, SpecialTokens, Tokenizer, format_chat_prompt,
-    validate_and_tokenize,
+    PrefixRadixIndex, PromptPreparationRequest, SimpleTokenizer, SpecialTokens, Tokenizer,
+    format_chat_prompt, validate_and_tokenize,
 };
 
 fn create_test_simple_tokenizer() -> SimpleTokenizer {
@@ -298,4 +298,216 @@ fn test_sub_issue_74_control_plane_runtime_execution() {
         placements_resp,
         AdminResponse::ActivePlacements(vec!["qwen2.5-7b".to_owned()])
     );
+}
+
+#[test]
+fn test_sub_issue_73_true_lru_recency_and_multi_pass_eviction() {
+    let index = PrefixRadixIndex::new();
+
+    let b0: Vec<u32> = (0..16).collect();
+    let b1: Vec<u32> = (16..32).collect();
+    let b2: Vec<u32> = (32..48).collect();
+
+    // 1. Test True LRU Recency: queries update access tick
+    // Insert block A at tick 1, block B at tick 2
+    index.insert("p1", "m1", &b0, &[10]);
+    index.insert("p1", "m1", &b1, &[20]);
+
+    // Access block A repeatedly via match_longest_prefix
+    for _ in 0..5 {
+        let res = index.match_longest_prefix("p1", "m1", &b0);
+        assert_eq!(res.matched_blocks, vec![10]);
+    }
+
+    // Evict 1 block: block B (unaccessed) must be evicted, not block A (recently accessed)
+    let evicted = index.evict_lru("p1", "m1", 1);
+    assert_eq!(evicted, vec![20]);
+    assert_eq!(
+        index.match_longest_prefix("p1", "m1", &b0).matched_blocks,
+        vec![10]
+    );
+
+    // 2. Test Multi-Pass Leaf Eviction across tree depth
+    let mut seq = Vec::new();
+    seq.extend_from_slice(&b0);
+    seq.extend_from_slice(&b1);
+    seq.extend_from_slice(&b2);
+
+    let deep_index = PrefixRadixIndex::new();
+    deep_index.insert("p2", "m2", &seq, &[100, 101, 102]);
+    assert_eq!(deep_index.stats().total_cached_blocks, 3);
+
+    // Evict 2 blocks from 3-block deep linear chain (initial leaves = 1)
+    let evicted_deep = deep_index.evict_lru("p2", "m2", 2);
+    assert_eq!(evicted_deep, vec![102, 101]);
+    assert_eq!(deep_index.stats().total_cached_blocks, 1);
+    assert_eq!(
+        deep_index
+            .match_longest_prefix("p2", "m2", &seq)
+            .matched_blocks,
+        vec![100]
+    );
+}
+
+#[test]
+fn test_sub_issue_73_invalidate_model_across_all_projects_and_clear_cache_admin() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    let b0: Vec<u32> = (0..32).collect();
+
+    // Populate prefix blocks for model-shared across two different projects
+    runtime.insert_prefix("project-one", "model-shared", &b0, &[1, 2]);
+    runtime.insert_prefix("project-two", "model-shared", &b0, &[3, 4]);
+    runtime.insert_prefix("project-one", "model-other", &b0, &[5, 6]);
+
+    let stats_before = runtime.prefix_cache_stats();
+    assert_eq!(stats_before.total_projects, 2);
+    assert_eq!(stats_before.total_models, 2);
+    assert_eq!(stats_before.total_cached_blocks, 6);
+
+    // Clear model-shared across all projects (project_id = None, model_id = Some)
+    let clear_resp = runtime
+        .execute_admin(AdminCommand::ClearPrefixCache {
+            project_id: None,
+            model_id: Some("model-shared".to_owned()),
+        })
+        .unwrap();
+    assert_eq!(clear_resp, AdminResponse::CacheCleared(4));
+
+    // Entries for model-shared in both project-one and project-two are gone
+    assert!(
+        runtime
+            .match_prefix("project-one", "model-shared", &b0)
+            .is_empty()
+    );
+    assert!(
+        runtime
+            .match_prefix("project-two", "model-shared", &b0)
+            .is_empty()
+    );
+
+    // model-other in project-one remains intact
+    assert_eq!(
+        runtime
+            .match_prefix("project-one", "model-other", &b0)
+            .matched_blocks,
+        vec![5, 6]
+    );
+}
+
+#[test]
+fn test_sub_issue_74_worker_thread_panic_resilience() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    // 1. Dispatch task that panics
+    let panic_res = runtime.dispatch_control_task(|_| -> () {
+        panic!("simulated transient task panic");
+    });
+    assert!(panic_res.is_err());
+    let err_msg = format!("{:?}", panic_res.unwrap_err());
+    assert!(err_msg.contains("panicked"));
+
+    // 2. Dispatch subsequent task to the worker pool: thread is still alive and responds cleanly
+    let ok_res = runtime.dispatch_control_task(|core| core);
+    assert!(ok_res.is_ok());
+    let core = ok_res.unwrap();
+    assert!(core == 6 || core == 7);
+}
+
+#[test]
+fn test_sub_issue_72_custom_template_priority_and_prepared_prompt() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    let mut tok = create_test_simple_tokenizer();
+    tok.add_token("<custom>", 2000);
+    tok.add_token("</custom>", 2001);
+    runtime.register_tokenizer("model-custom", Arc::new(tok));
+
+    // Register custom chat template
+    let custom_template = ChatTemplate::new(Some("<custom> {{prompt}} </custom>".to_owned()));
+    runtime.register_template("model-custom", custom_template);
+
+    // Both format_prompt and tokenize_prompt use the custom template
+    let formatted = runtime
+        .format_prompt("model-custom", "hello world")
+        .unwrap();
+    assert_eq!(formatted, "<custom> hello world </custom>");
+
+    // prepare_prompt returns both formatted_text and token_ids
+    let prep_req = PromptPreparationRequest::new("hello world", true, 64);
+    let prepared = runtime.prepare_prompt("model-custom", &prep_req).unwrap();
+    assert_eq!(prepared.formatted_text, "<custom> hello world </custom>");
+    assert_eq!(prepared.token_count(), 4);
+    assert_eq!(prepared.token_ids, vec![2000, 1000, 1001, 2001]);
+
+    // Get tokenizer, decode, and decode_piece
+    let decoded = runtime.decode("model-custom", &[1000, 1001]).unwrap();
+    assert_eq!(decoded, "hello world");
+
+    let piece = runtime.decode_piece("model-custom", 1000).unwrap();
+    assert_eq!(piece, Some("hello".to_owned()));
+
+    let stop_piece = runtime.decode_piece("model-custom", 2).unwrap();
+    assert_eq!(stop_piece, None); // stop token returns None
+}
+
+#[test]
+fn test_sub_issue_74_dispatched_control_plane_methods() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(capacity, mock_affinity)
+        .expect("runtime creation");
+
+    let mut tok = create_test_simple_tokenizer();
+    tok.add_token("[INST]", 2002);
+    tok.add_token("[/INST]", 2003);
+    runtime.register_tokenizer("m-disp", Arc::new(tok));
+    runtime.register_template(
+        "m-disp",
+        ChatTemplate::new(Some("[INST] {{prompt}} [/INST]".to_owned())),
+    );
+
+    // 1. dispatch_format_prompt
+    let formatted = runtime
+        .dispatch_format_prompt("m-disp".to_owned(), "test message".to_owned())
+        .unwrap();
+    assert_eq!(formatted, "[INST] test message [/INST]");
+
+    // 2. dispatch_tokenize_prompt
+    let tokens = runtime
+        .dispatch_tokenize_prompt("m-disp".to_owned(), "hello world".to_owned(), false, 16)
+        .unwrap();
+    assert_eq!(tokens, vec![1000, 1001]);
+
+    // 3. dispatch_prepare_prompt
+    let prep = runtime
+        .dispatch_prepare_prompt("m-disp".to_owned(), "hello world".to_owned(), true, 16)
+        .unwrap();
+    assert_eq!(prep.formatted_text, "[INST] hello world [/INST]");
+    assert_eq!(prep.token_ids, vec![2002, 1000, 1001, 2003]);
+
+    // 4. dispatch_match_prefix
+    let b0: Vec<u32> = (0..16).collect();
+    runtime.insert_prefix("proj-x", "m-disp", &b0, &[99]);
+    let match_res = runtime
+        .dispatch_match_prefix("proj-x".to_owned(), "m-disp".to_owned(), b0)
+        .unwrap();
+    assert_eq!(match_res.matched_blocks, vec![99]);
 }
