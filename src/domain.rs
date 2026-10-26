@@ -281,13 +281,16 @@ pub fn validate_model_id(model_id: &str) -> Result<(), ManagerError> {
     }
     if trimmed == "."
         || trimmed == ".."
+        || trimmed.starts_with('.')
+        || trimmed.starts_with("cgroup.")
+        || trimmed.starts_with("cpuset.")
         || trimmed.contains('/')
         || trimmed.contains('\\')
         || trimmed.contains("..")
         || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
     {
         return Err(ManagerError::WorkerSpawn(format!(
-            "invalid model_id '{model_id}': cannot contain path separators, whitespace, control characters, or traversal components"
+            "invalid model_id '{model_id}': cannot contain path separators, whitespace, control characters, cgroup interface prefixes, or traversal components"
         )));
     }
     Ok(())
@@ -570,13 +573,14 @@ impl OsAffinityBackend for RealOsAffinityBackend {
             if (mask & A100_CLUSTER_MASK) != 0 {
                 let set_ai_thread_path = Path::new("/proc/set_ai_thread");
                 if set_ai_thread_path.exists() {
-                    let tid_to_write = if pid == 0 {
+                    let tid_str = if pid == 0 {
                         // SAFETY: SYS_gettid syscall takes no arguments and has no side effects.
-                        unsafe { libc::syscall(libc::SYS_gettid) }
+                        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                        format!("{tid}\n")
                     } else {
-                        pid as libc::c_long
+                        format!("{pid}\n")
                     };
-                    let _ = std::fs::write(set_ai_thread_path, format!("{tid_to_write}\n"));
+                    let _ = std::fs::write(set_ai_thread_path, tid_str);
                 }
             }
 
@@ -591,8 +595,9 @@ impl OsAffinityBackend for RealOsAffinityBackend {
 
             let target = pid as libc::pid_t;
             // SAFETY: Invokes standard sched_setaffinity syscall for target pid.
-            let ret =
-                unsafe { libc::sched_setaffinity(target, size_of::<libc::cpu_set_t>(), &set) };
+            let ret = unsafe {
+                libc::sched_setaffinity(target, size_of::<libc::cpu_set_t>(), &raw const set)
+            };
             if ret != 0 {
                 let err = io::Error::last_os_error();
                 return Err(ManagerError::Affinity(K3Error::AffinityError {

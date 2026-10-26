@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use k3_core::affinity::ControlPlaneCapacityConfig;
+use k3_core::ipc::shm::SharedMemoryArena;
 use k3_manager::capacity::{
     CgroupV2DomainController, ControlPlaneScheduler, DomainPlacementMode, MockCgroupFs,
     MockOsAffinityBackend, format_cpuset_list, parse_cpuset_list, resolve_worker_compute_mask,
@@ -492,6 +493,10 @@ fn test_model_id_validation_rejects_empty_and_traversal() {
         "qwen2.5 ",
         "\x1b[31mmodel",
         "model\x7f",
+        ".hidden",
+        "cgroup.procs",
+        "cgroup.threads",
+        "cpuset.cpus",
     ];
 
     for &bad_model in invalid_models {
@@ -795,4 +800,161 @@ fn test_multi_model_worker_placement_concurrent_supervisors() {
             Some(format!("{pid}\n").as_str())
         );
     }
+}
+
+fn create_dummy_gguf_weights(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("k3_domain_test_{name}_{}.gguf", std::process::id()));
+    let magic: [u8; 4] = *b"GGUF";
+    let version: u32 = 3;
+    let tensor_count: u64 = 0;
+    let kv_count: u64 = 0;
+
+    let mut data = Vec::new();
+    data.extend_from_slice(&magic);
+    data.extend_from_slice(&version.to_le_bytes());
+    data.extend_from_slice(&tensor_count.to_le_bytes());
+    data.extend_from_slice(&kv_count.to_le_bytes());
+
+    std::fs::write(&p, data).expect("write dummy gguf");
+    p
+}
+
+static TEST_SOCK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn unique_socket_path(name: &str) -> PathBuf {
+    let pid = std::process::id();
+    let seq = TEST_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{name}_{pid}_{seq}.sock"))
+}
+
+#[test]
+fn test_supervisor_spawn_worker_early_validation_rejection() {
+    let dummy_weights = PathBuf::from("/tmp/dummy_early_weights.gguf");
+    let dummy_socket = PathBuf::from("/tmp/dummy_early_sock.sock");
+
+    let arena = SharedMemoryArena::create("early_val_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // 1. Invalid model_id rejection before spawn
+    let invalid_models = [
+        "",
+        "   ",
+        "model/traversal",
+        "model a",
+        "model\n",
+        "cgroup.procs",
+        ".hidden",
+    ];
+    for bad_id in invalid_models {
+        let placement = WorkerPlacement::new(bad_id, &dummy_weights, &dummy_socket, "x100");
+        let dup_arena = arena
+            .duplicate_fd()
+            .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+            .expect("dup");
+        let err = supervisor
+            .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+            .unwrap_err();
+        assert!(matches!(err, ManagerError::WorkerSpawn(_)));
+    }
+
+    // 2. Invalid affinity rejection before spawn
+    let invalid_affinities = ["-1", "not_a_num", "0-16", "16", "0x10000"];
+    for bad_aff in invalid_affinities {
+        let mut placement =
+            WorkerPlacement::new("valid_model", &dummy_weights, &dummy_socket, "x100");
+        placement.affinity = Some(bad_aff.to_string());
+        let dup_arena = arena
+            .duplicate_fd()
+            .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+            .expect("dup");
+        let err = supervisor
+            .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManagerError::WorkerSpawn(_) | ManagerError::Affinity(_)
+            ),
+            "expected rejection for '{bad_aff}', got {err:?}"
+        );
+    }
+
+    assert_eq!(supervisor.worker_count(), 0);
+}
+
+#[test]
+fn test_supervisor_spawn_worker_with_mock_domain_controller() {
+    let fs = Arc::new(MockCgroupFs::new());
+    let aff = Arc::new(MockOsAffinityBackend::new());
+    let controller = Arc::new(
+        CgroupV2DomainController::new("/mock/cgroup")
+            .with_fs(fs.clone())
+            .with_affinity_backend(aff.clone()),
+    );
+
+    let weights_path = create_dummy_gguf_weights("mock_sup_worker");
+    let sock_path = unique_socket_path("m1");
+    let arena = SharedMemoryArena::create("sup_arena", 65536).expect("create arena");
+
+    let placement =
+        WorkerPlacement::new("mock-model", &weights_path, &sock_path, "x100").with_affinity("0-5");
+
+    let mut supervisor = WorkerSupervisor::new().with_domain_controller(controller);
+
+    let worker = supervisor
+        .spawn_worker(placement, arena, 100, 65536, 64, 4)
+        .expect("spawn worker");
+
+    assert!(worker.is_alive());
+    let worker_pid = worker.pid().expect("worker pid");
+    assert_eq!(worker.generation(), 1);
+
+    // Verify mock cgroup fs has received leaf directory, cpuset, and procs writes
+    assert!(fs.is_dir_created("/mock/cgroup/engines/mock-model"));
+    assert_eq!(
+        fs.written_file("/mock/cgroup/engines/mock-model/cpuset.cpus")
+            .as_deref(),
+        Some("0-5\n")
+    );
+    assert_eq!(
+        fs.written_file("/mock/cgroup/engines/mock-model/cgroup.procs")
+            .as_deref(),
+        Some(format!("{worker_pid}\n").as_str())
+    );
+
+    let outcome = worker.last_placement_outcome().expect("outcome");
+    assert_eq!(outcome.target_id, worker_pid);
+    assert!(outcome.mode.is_cgroup_v2());
+
+    // 2. Fallback to OS affinity when cgroup v2 write fails
+    fs.inject_error(
+        "/mock/cgroup/engines/fallback-model",
+        io::ErrorKind::PermissionDenied,
+    );
+    let weights_fallback = create_dummy_gguf_weights("mock_sup_fallback");
+    let sock_fallback = unique_socket_path("m2");
+    let arena_fallback =
+        SharedMemoryArena::create("sup_arena_fallback", 65536).expect("create arena");
+    let placement_fallback =
+        WorkerPlacement::new("fallback-model", &weights_fallback, &sock_fallback, "x100")
+            .with_affinity("0-5");
+
+    let worker_fallback = supervisor
+        .spawn_worker(placement_fallback, arena_fallback, 101, 65536, 64, 4)
+        .expect("spawn worker fallback");
+
+    assert!(worker_fallback.is_alive());
+    let fallback_pid = worker_fallback.pid().expect("fallback pid");
+    let fallback_outcome = worker_fallback.last_placement_outcome().expect("outcome");
+    assert_eq!(fallback_outcome.target_id, fallback_pid);
+    assert!(fallback_outcome.mode.is_os_affinity_fallback());
+    assert!(aff.has_called(fallback_pid, 0x003F));
+
+    // Teardown
+    supervisor.shutdown_all();
+    let _ = std::fs::remove_file(&weights_path);
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&weights_fallback);
+    let _ = std::fs::remove_file(&sock_fallback);
 }

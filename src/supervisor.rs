@@ -556,8 +556,9 @@ fn spawn_and_attach_process(
     cmd.arg("--socket").arg(&placement.socket_path);
     cmd.arg("--cluster").arg(&placement.cluster);
 
-    if let Some(aff) = &placement.affinity {
-        cmd.arg("--affinity").arg(aff);
+    if placement.affinity.is_some() {
+        let compute_mask = resolve_worker_compute_mask(placement)?;
+        cmd.arg("--affinity").arg(format!("0x{compute_mask:04X}"));
     }
     if let Some(threads) = placement.threads {
         cmd.arg("--threads").arg(threads.to_string());
