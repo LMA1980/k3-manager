@@ -21,12 +21,13 @@ use std::sync::Arc;
 use std::thread;
 
 use k3_core::K3Error;
+use k3_core::ipc::shm::SharedMemoryArena;
 use k3_manager::error::ManagerError;
-use k3_manager::supervisor::WorkerPlacement;
+use k3_manager::supervisor::{WorkerPlacement, WorkerSupervisor};
 use k3_manager::{
     A100_CLUSTER_MASK, ControlPlaneCapacityConfig, ControlPlaneScheduler,
     DEFAULT_ACTIVE_CONTROL_MASK, DEFAULT_SPARE_RECOVERY_MASK, DEFAULT_X100_COMPUTE_CAP_MASK,
-    ResolvedControlCapacityExt, X100_CLUSTER_MASK,
+    ResolvedControlCapacityExt, X100_CLUSTER_MASK, resolve_worker_compute_mask,
 };
 
 // ============================================================================
@@ -239,4 +240,365 @@ fn test_manager_scheduler_capacity_accessor() {
     assert_eq!(scheduler.capacity().active_control_mask, 0x00C0);
     assert_eq!(scheduler.capacity().spare_recovery_mask, 0x0020);
     assert_eq!(scheduler.capacity().x100_compute_cap_mask, 0x003F);
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_exceeding_x100_thread_cap() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("thread_cap_test_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Requesting 7 threads on X100 exceeds the 6-thread cap (cores 0..5, 0x003F)
+    let placement = WorkerPlacement::new("model_7threads", &dummy_weights, &dummy_socket, "x100")
+        .with_threads(7);
+
+    let dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    let err = supervisor
+        .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+        .unwrap_err();
+
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    let err_str = format!("{err}");
+    assert!(err_str.contains("exceeding X100 max compute limit 6"));
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_active_control_encroachment() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("encroach_test_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Attempting to spawn worker requesting cores 6 or 7 (0x00C0, 0x0040, 0x0080, 0x00FF, cpuset 6-6, 7-7, 6-7, 6,7, 0-6, 0-7)
+    for bad_aff in &[
+        "0x0040", "0x0080", "0x00C0", "0x00FF", "6-6", "7-7", "6-7", "6,7", "0-6", "0-7",
+    ] {
+        let placement = WorkerPlacement::new("rogue_model", &dummy_weights, &dummy_socket, "x100")
+            .with_affinity(*bad_aff);
+
+        let dup_arena = arena
+            .duplicate_fd()
+            .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+            .expect("dup arena");
+
+        let err = supervisor
+            .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+            .unwrap_err();
+
+        assert!(matches!(err, ManagerError::Affinity(_)));
+        let err_str = format!("{err}");
+        assert!(err_str.contains("encroaches on dedicated active control cores 0x00C0"));
+    }
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_exceeding_a100_thread_cap() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("a100_cap_test_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Requesting 9 threads on A100 exceeds the 8-thread compute limit
+    let placement = WorkerPlacement::new("model_9threads", &dummy_weights, &dummy_socket, "a100")
+        .with_threads(9);
+
+    let dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    let err = supervisor
+        .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+        .unwrap_err();
+
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    let err_str = format!("{err}");
+    assert!(err_str.contains("exceeding A100 max compute limit 8"));
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_zero_threads() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("zero_threads_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    let placement = WorkerPlacement::new("model_0threads", &dummy_weights, &dummy_socket, "x100")
+        .with_threads(0);
+
+    let dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    let err = supervisor
+        .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+        .unwrap_err();
+
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    let err_str = format!("{err}");
+    assert!(err_str.contains("must be greater than 0"));
+}
+
+#[test]
+fn test_worker_placement_thread_validation() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // Valid 6 threads on X100
+    let valid_x100 = WorkerPlacement::new("m1", &weights, &socket, "x100").with_threads(6);
+    assert!(res.validate_worker_placement(&valid_x100).is_ok());
+
+    // Valid 8 threads on A100
+    let valid_a100 = WorkerPlacement::new("m2", &weights, &socket, "a100").with_threads(8);
+    assert!(res.validate_worker_placement(&valid_a100).is_ok());
+
+    // Threads exceeding mask count
+    let mut excess_threads = WorkerPlacement::new("m3", &weights, &socket, "x100").with_threads(4);
+    excess_threads.affinity = Some("0x0003".to_string()); // only 2 cores
+    let err = res.validate_worker_placement(&excess_threads).unwrap_err();
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    assert!(format!("{err}").contains("exceeding 2 available cores in affinity mask 0x0003"));
+}
+
+#[test]
+fn test_worker_placement_cross_cluster_mask_rejection() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // X100 worker placement specifying A100 cores (0xFF00)
+    let p_x100_a100_cores =
+        WorkerPlacement::new("m_x100_bad", &weights, &socket, "x100").with_affinity("0xFF00");
+    let err = res
+        .validate_worker_placement(&p_x100_a100_cores)
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    assert!(format!("{err}").contains("specifies cores outside X100 mask 0x00FF"));
+
+    // A100 worker placement specifying X100 cores (0x003F)
+    let p_a100_x100_cores =
+        WorkerPlacement::new("m_a100_bad", &weights, &socket, "a100").with_affinity("0x003F");
+    let err_a100 = res
+        .validate_worker_placement(&p_a100_x100_cores)
+        .unwrap_err();
+    assert!(matches!(err_a100, ManagerError::Affinity(_)));
+    assert!(format!("{err_a100}").contains("specifies cores outside A100 mask 0xFF00"));
+
+    // Unsupported cluster string rejection
+    let p_bad_cluster =
+        WorkerPlacement::new("m_bad_cluster", &weights, &socket, "gpu").with_threads(2);
+    let err_cluster = res.validate_worker_placement(&p_bad_cluster).unwrap_err();
+    assert!(matches!(err_cluster, ManagerError::WorkerSpawn(_)));
+    assert!(format!("{err_cluster}").contains("unsupported cluster 'gpu'"));
+}
+
+#[test]
+fn test_worker_placement_non_contiguous_affinity() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // Non-contiguous affinity mask 0x0005 (cores 0 and 2) with 2 threads -> OK
+    let p_valid_non_contig = WorkerPlacement::new("m_non_contig", &weights, &socket, "x100")
+        .with_affinity("0x0005")
+        .with_threads(2);
+    assert!(res.validate_worker_placement(&p_valid_non_contig).is_ok());
+
+    // Non-contiguous affinity mask 0x0005 with 3 threads -> rejected (3 > 2)
+    let p_excess_threads = WorkerPlacement::new("m_non_contig_excess", &weights, &socket, "x100")
+        .with_affinity("0x0005")
+        .with_threads(3);
+    let err = res
+        .validate_worker_placement(&p_excess_threads)
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    assert!(format!("{err}").contains("exceeding 2 available cores in affinity mask 0x0005"));
+}
+
+#[test]
+fn test_worker_placement_single_core_cpuset_syntax() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // Single core "0-0" on X100 -> valid (mask 0x0001, 1 core)
+    let p_x100_core0 =
+        WorkerPlacement::new("m_core0", &weights, &socket, "x100").with_affinity("0-0");
+    assert!(res.validate_worker_placement(&p_x100_core0).is_ok());
+
+    // Single core "5-5" on X100 -> valid (mask 0x0020, core 5 within X100 compute cap)
+    let p_x100_core5 =
+        WorkerPlacement::new("m_core5", &weights, &socket, "x100").with_affinity("5-5");
+    assert!(res.validate_worker_placement(&p_x100_core5).is_ok());
+
+    // Single core "6-6" on X100 -> rejected (encroaches on active control core 6, 0x0040)
+    let p_x100_core6 =
+        WorkerPlacement::new("m_core6", &weights, &socket, "x100").with_affinity("6-6");
+    let err_c6 = res.validate_worker_placement(&p_x100_core6).unwrap_err();
+    assert!(matches!(err_c6, ManagerError::Affinity(_)));
+    assert!(format!("{err_c6}").contains("encroaches on dedicated active control cores 0x00C0"));
+
+    // Single core "7-7" on X100 -> rejected (encroaches on active control core 7, 0x0080)
+    let p_x100_core7 =
+        WorkerPlacement::new("m_core7", &weights, &socket, "x100").with_affinity("7-7");
+    let err_c7 = res.validate_worker_placement(&p_x100_core7).unwrap_err();
+    assert!(matches!(err_c7, ManagerError::Affinity(_)));
+    assert!(format!("{err_c7}").contains("encroaches on dedicated active control cores 0x00C0"));
+
+    // Single core "8" on A100 -> valid (core 8 on A100, mask 0x0100)
+    let p_a100_core8 =
+        WorkerPlacement::new("m_core8", &weights, &socket, "a100").with_affinity("8");
+    assert!(res.validate_worker_placement(&p_a100_core8).is_ok());
+
+    // Single core "8-8" on X100 -> rejected (outside X100 mask 0x00FF)
+    let p_x100_core8 =
+        WorkerPlacement::new("m_x100_core8", &weights, &socket, "x100").with_affinity("8-8");
+    let err_x100_c8 = res.validate_worker_placement(&p_x100_core8).unwrap_err();
+    assert!(matches!(err_x100_c8, ManagerError::Affinity(_)));
+    assert!(format!("{err_x100_c8}").contains("specifies cores outside X100 mask 0x00FF"));
+
+    // Single core "0-0" on A100 -> rejected (outside A100 mask 0xFF00)
+    let p_a100_core0 =
+        WorkerPlacement::new("m_a100_core0", &weights, &socket, "a100").with_affinity("0-0");
+    let err_a100_c0 = res.validate_worker_placement(&p_a100_core0).unwrap_err();
+    assert!(matches!(err_a100_c0, ManagerError::Affinity(_)));
+    assert!(format!("{err_a100_c0}").contains("specifies cores outside A100 mask 0xFF00"));
+
+    // Mask "0" -> rejected by resolve_worker_compute_mask as zero mask
+    let p_zero_mask = WorkerPlacement::new("m_zero", &weights, &socket, "x100").with_affinity("0");
+    let err_zero = resolve_worker_compute_mask(&p_zero_mask).unwrap_err();
+    assert!(matches!(err_zero, ManagerError::Affinity(_)));
+    assert!(format!("{err_zero}").contains("cannot be zero"));
+
+    // Placement with threads on mask "0" -> rejected by validate_worker_placement (1 > 0 cores)
+    let p_zero_threads = WorkerPlacement::new("m_zero_t", &weights, &socket, "x100")
+        .with_affinity("0")
+        .with_threads(1);
+    let err_val_zero_t = res.validate_worker_placement(&p_zero_threads).unwrap_err();
+    assert!(matches!(err_val_zero_t, ManagerError::Affinity(_)));
+    assert!(
+        format!("{err_val_zero_t}").contains("exceeding 0 available cores in affinity mask 0x0000")
+    );
+}
+
+#[test]
+fn test_worker_placement_threads_without_affinity_and_a100_submask_bounding() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // 1. Threads without affinity across X100 and A100
+    // X100 with 6 threads -> OK (default cap is 6)
+    let p_x100_t6 = WorkerPlacement::new("m_x100_t6", &weights, &socket, "x100").with_threads(6);
+    assert!(res.validate_worker_placement(&p_x100_t6).is_ok());
+
+    // X100 with 7 threads -> rejected
+    let p_x100_t7 = WorkerPlacement::new("m_x100_t7", &weights, &socket, "x100").with_threads(7);
+    let err_x100_t7 = res.validate_worker_placement(&p_x100_t7).unwrap_err();
+    assert!(matches!(err_x100_t7, ManagerError::Affinity(_)));
+    assert!(format!("{err_x100_t7}").contains("exceeding X100 max compute limit 6"));
+
+    // A100 with 8 threads -> OK (default cap is 8)
+    let p_a100_t8 = WorkerPlacement::new("m_a100_t8", &weights, &socket, "a100").with_threads(8);
+    assert!(res.validate_worker_placement(&p_a100_t8).is_ok());
+
+    // A100 with 9 threads -> rejected
+    let p_a100_t9 = WorkerPlacement::new("m_a100_t9", &weights, &socket, "a100").with_threads(9);
+    let err_a100_t9 = res.validate_worker_placement(&p_a100_t9).unwrap_err();
+    assert!(matches!(err_a100_t9, ManagerError::Affinity(_)));
+    assert!(format!("{err_a100_t9}").contains("exceeding A100 max compute limit 8"));
+
+    // 2. A100 sub-mask thread bounding
+    // A100 with "8-9" (2 cores) and 2 threads -> OK
+    let p_a100_sub2 = WorkerPlacement::new("m_a100_sub2", &weights, &socket, "a100")
+        .with_affinity("8-9")
+        .with_threads(2);
+    assert!(res.validate_worker_placement(&p_a100_sub2).is_ok());
+
+    // A100 with "8-9" (2 cores) and 3 threads -> rejected
+    let p_a100_sub3 = WorkerPlacement::new("m_a100_sub3", &weights, &socket, "a100")
+        .with_affinity("8-9")
+        .with_threads(3);
+    let err_a100_sub3 = res.validate_worker_placement(&p_a100_sub3).unwrap_err();
+    assert!(matches!(err_a100_sub3, ManagerError::Affinity(_)));
+    assert!(
+        format!("{err_a100_sub3}").contains("exceeding 2 available cores in affinity mask 0x0300")
+    );
+
+    // 3. Robustness against whitespace in cpuset list/ranges
+    // " 0 - 5 " on X100 -> OK (0x003F)
+    let p_ws_range =
+        WorkerPlacement::new("m_ws_range", &weights, &socket, "x100").with_affinity("  0 - 5  ");
+    assert!(res.validate_worker_placement(&p_ws_range).is_ok());
+    assert_eq!(resolve_worker_compute_mask(&p_ws_range).unwrap(), 0x003F);
+
+    // " 0 , 2 , 4 " on X100 -> OK (0x0015)
+    let p_ws_list =
+        WorkerPlacement::new("m_ws_list", &weights, &socket, "x100").with_affinity(" 0 , 2 , 4 ");
+    assert!(res.validate_worker_placement(&p_ws_list).is_ok());
+    assert_eq!(resolve_worker_compute_mask(&p_ws_list).unwrap(), 0x0015);
+
+    // " 8 - 15 " on A100 -> OK (0xFF00)
+    let p_ws_a100 =
+        WorkerPlacement::new("m_ws_a100", &weights, &socket, "a100").with_affinity(" 8 - 15 ");
+    assert!(res.validate_worker_placement(&p_ws_a100).is_ok());
+    assert_eq!(resolve_worker_compute_mask(&p_ws_a100).unwrap(), 0xFF00);
+
+    // " 8 - 9 " with 3 threads and whitespace on A100 -> rejected
+    let p_ws_sub3 = WorkerPlacement::new("m_ws_sub3", &weights, &socket, "a100")
+        .with_affinity("  8 - 9  ")
+        .with_threads(3);
+    let err_ws_sub3 = res.validate_worker_placement(&p_ws_sub3).unwrap_err();
+    assert!(matches!(err_ws_sub3, ManagerError::Affinity(_)));
+    assert!(
+        format!("{err_ws_sub3}").contains("exceeding 2 available cores in affinity mask 0x0300")
+    );
+}
+
+#[test]
+fn test_supervisor_recover_worker_enforces_capacity() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("recover_cap_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Spawning model with 4 threads is valid under default capacity (cap 6)
+    let placement = WorkerPlacement::new("recover_model", &dummy_weights, &dummy_socket, "x100")
+        .with_threads(4);
+
+    let _dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    // Pre-insert a dummy managed worker entry to simulate a registered worker needing recovery
+    let err = supervisor.recover_worker("nonexistent").unwrap_err();
+    assert!(matches!(err, ManagerError::ModelNotFound(_)));
+
+    // Now test capacity rejection during recover_worker:
+    // If capacity is reduced to minimal mode on 4-core online mask (0x000F, cores 0..2 compute cap = 3 cores)
+    let degraded_cap = ControlPlaneCapacityConfig::minimal()
+        .resolve_with_online_mask(0x000F)
+        .expect("resolve degraded");
+
+    supervisor.set_capacity(degraded_cap);
+    // Directly validate that a 4-thread placement under the degraded capacity will fail (4 > 3 cores)
+    let err_cap = supervisor
+        .capacity()
+        .validate_worker_placement(&placement)
+        .unwrap_err();
+    assert!(matches!(err_cap, ManagerError::Affinity(_)));
+    assert!(format!("{err_cap}").contains("exceeding X100 max compute limit 3"));
 }

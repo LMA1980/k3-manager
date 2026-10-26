@@ -15,7 +15,8 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use k3_core::affinity::ResolvedControlCapacity;
+use crate::capacity::ResolvedControlCapacityExt;
+use k3_core::affinity::{ControlPlaneCapacityConfig, ResolvedControlCapacity};
 use k3_core::ipc::layout::{ArenaHeader, KvBlockMeta, KvBlockTag};
 use k3_core::ipc::protocol::{
     AttachArenaCommand, IpcMessage, StatusCode, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
@@ -697,6 +698,7 @@ fn spawn_and_attach_process(
 pub struct WorkerSupervisor {
     workers: HashMap<String, ManagedWorker>,
     domain_controller: Arc<dyn IsolationDomainController>,
+    capacity: ResolvedControlCapacity,
 }
 
 impl Default for WorkerSupervisor {
@@ -706,12 +708,18 @@ impl Default for WorkerSupervisor {
 }
 
 impl WorkerSupervisor {
-    /// Constructs a new [`WorkerSupervisor`] using the default cgroup v2 domain controller.
+    /// Constructs a new [`WorkerSupervisor`] using the default cgroup v2 domain controller
+    /// and default resolved control plane capacity.
     #[must_use]
+    #[allow(clippy::missing_panics_doc)]
     pub fn new() -> Self {
+        let capacity = ControlPlaneCapacityConfig::default()
+            .resolve_default()
+            .expect("default control plane capacity resolution is guaranteed valid");
         Self {
             workers: HashMap::new(),
             domain_controller: Arc::new(CgroupV2DomainController::default()),
+            capacity,
         }
     }
 
@@ -728,6 +736,24 @@ impl WorkerSupervisor {
     ) -> Self {
         self.domain_controller = controller;
         self
+    }
+
+    /// Sets the custom [`ResolvedControlCapacity`] for compute worker placement admission.
+    pub fn set_capacity(&mut self, capacity: ResolvedControlCapacity) {
+        self.capacity = capacity;
+    }
+
+    /// Sets the custom [`ResolvedControlCapacity`] using builder syntax.
+    #[must_use]
+    pub fn with_capacity(mut self, capacity: ResolvedControlCapacity) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
+    /// Returns a reference to the active [`ResolvedControlCapacity`].
+    #[must_use]
+    pub const fn capacity(&self) -> &ResolvedControlCapacity {
+        &self.capacity
     }
 
     /// Returns a reference to the active [`IsolationDomainController`].
@@ -789,8 +815,9 @@ impl WorkerSupervisor {
         n_ctx: u32,
         max_blocks: u32,
     ) -> Result<&mut ManagedWorker, ManagerError> {
-        // Validate model identifier and resolve compute mask before spawning process
+        // Validate model identifier and placement capacity upfront before spawning process
         validate_model_id(&placement.model_id)?;
+        self.capacity.validate_worker_placement(&placement)?;
         let compute_mask = resolve_worker_compute_mask(&placement)?;
 
         // If a worker with this model_id already exists, cleanly tear it down first
@@ -898,6 +925,7 @@ impl WorkerSupervisor {
         worker.stream = None;
 
         validate_model_id(&worker.placement.model_id)?;
+        self.capacity.validate_worker_placement(&worker.placement)?;
         let compute_mask = resolve_worker_compute_mask(&worker.placement)?;
 
         // 2. Spawn replacement worker and re-attach surviving arena via SCM_RIGHTS
