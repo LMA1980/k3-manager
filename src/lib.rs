@@ -9,6 +9,9 @@ pub mod client;
 pub mod dispatch;
 pub mod domain;
 pub mod error;
+pub mod prefix;
+pub mod prompt;
+pub mod runtime;
 pub mod supervisor;
 
 pub use capacity::{
@@ -31,4 +34,14 @@ pub use domain::{
     validate_model_id,
 };
 pub use error::ManagerError;
+pub use prefix::{
+    BLOCK_SIZE_TOKENS, BlockTokens, PrefixCacheStats, PrefixMatchResult, PrefixRadixIndex,
+};
+pub use prompt::{
+    ChatTemplate, DetokenizeStep, GgufTokenizer, IncrementalStopDetector, PreparedPrompt,
+    PromptOrchestrator, PromptPreparationRequest, SimpleTokenizer, SpecialTokens,
+    StreamingDetokenizer, TokenType, Tokenizer, evaluate_stop_token, format_chat_prompt,
+    validate_and_tokenize,
+};
+pub use runtime::{AdminCommand, AdminResponse, ControlPlaneRuntime, WorkerHealthSnapshot};
 pub use supervisor::{ManagedWorker, WorkerPlacement, WorkerSupervisor, find_worker_binary};
