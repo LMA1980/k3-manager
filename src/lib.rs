@@ -7,6 +7,7 @@
 pub mod capacity;
 pub mod client;
 pub mod dispatch;
+pub mod domain;
 pub mod error;
 pub mod supervisor;
 
@@ -22,6 +23,12 @@ pub use client::KvClient;
 pub use dispatch::{
     ForwardPassRequest, ForwardPassResult, dispatch_forward_pass, wrap_input_tokens_as_arrow,
     wrap_logits_as_float32_array,
+};
+pub use domain::{
+    CgroupFs, CgroupV2DomainController, DomainPlacementMode, IsolationDomainController,
+    MockCgroupFs, MockOsAffinityBackend, OsAffinityBackend, PlacementOutcome, RealCgroupFs,
+    RealOsAffinityBackend, format_cpuset_list, parse_cpuset_list, resolve_worker_compute_mask,
+    validate_model_id,
 };
 pub use error::ManagerError;
 pub use supervisor::{ManagedWorker, WorkerPlacement, WorkerSupervisor, find_worker_binary};

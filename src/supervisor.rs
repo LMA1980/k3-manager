@@ -12,8 +12,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use k3_core::affinity::ResolvedControlCapacity;
 use k3_core::ipc::layout::{ArenaHeader, KvBlockMeta, KvBlockTag};
 use k3_core::ipc::protocol::{
     AttachArenaCommand, IpcMessage, StatusCode, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
@@ -22,6 +24,10 @@ use k3_core::ipc::protocol::{
 use k3_core::ipc::shm::SharedMemoryArena;
 
 use crate::dispatch::{ForwardPassRequest, ForwardPassResult, dispatch_forward_pass};
+use crate::domain::{
+    CgroupV2DomainController, IsolationDomainController, PlacementOutcome,
+    resolve_worker_compute_mask, validate_model_id,
+};
 use crate::error::ManagerError;
 
 /// Locates the `k3-worker` binary across environment variables, target outputs, and PATH.
@@ -159,6 +165,7 @@ pub struct ManagedWorker {
     arena: SharedMemoryArena,
     generation: u64,
     is_alive: bool,
+    last_placement_outcome: Option<PlacementOutcome>,
 }
 
 impl ManagedWorker {
@@ -201,6 +208,12 @@ impl ManagedWorker {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Returns the most recent isolation domain placement outcome for this worker, if available.
+    #[must_use]
+    pub const fn last_placement_outcome(&self) -> Option<&PlacementOutcome> {
+        self.last_placement_outcome.as_ref()
     }
 
     /// Checks if the worker process is currently running and healthy.
@@ -543,8 +556,9 @@ fn spawn_and_attach_process(
     cmd.arg("--socket").arg(&placement.socket_path);
     cmd.arg("--cluster").arg(&placement.cluster);
 
-    if let Some(aff) = &placement.affinity {
-        cmd.arg("--affinity").arg(aff);
+    if placement.affinity.is_some() {
+        let compute_mask = resolve_worker_compute_mask(placement)?;
+        cmd.arg("--affinity").arg(format!("0x{compute_mask:04X}"));
     }
     if let Some(threads) = placement.threads {
         cmd.arg("--threads").arg(threads.to_string());
@@ -679,18 +693,62 @@ fn spawn_and_attach_process(
 }
 
 /// Control-plane supervisor managing isolated compute workers and orchestrating recovery.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkerSupervisor {
     workers: HashMap<String, ManagedWorker>,
+    domain_controller: Arc<dyn IsolationDomainController>,
+}
+
+impl Default for WorkerSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkerSupervisor {
-    /// Constructs a new empty [`WorkerSupervisor`].
+    /// Constructs a new [`WorkerSupervisor`] using the default cgroup v2 domain controller.
     #[must_use]
     pub fn new() -> Self {
         Self {
             workers: HashMap::new(),
+            domain_controller: Arc::new(CgroupV2DomainController::default()),
         }
+    }
+
+    /// Sets the custom [`IsolationDomainController`] for compute worker and control domain placement.
+    pub fn set_domain_controller(&mut self, controller: Arc<dyn IsolationDomainController>) {
+        self.domain_controller = controller;
+    }
+
+    /// Sets the custom [`IsolationDomainController`] using builder syntax.
+    #[must_use]
+    pub fn with_domain_controller(
+        mut self,
+        controller: Arc<dyn IsolationDomainController>,
+    ) -> Self {
+        self.domain_controller = controller;
+        self
+    }
+
+    /// Returns a reference to the active [`IsolationDomainController`].
+    #[must_use]
+    pub fn domain_controller(&self) -> &Arc<dyn IsolationDomainController> {
+        &self.domain_controller
+    }
+
+    /// Places the control plane into its isolated cgroup v2 domain (`.../control`) or OS affinity fallback.
+    ///
+    /// If `target_pid` is 0, targets the current process ID (`std::process::id()`).
+    ///
+    /// # Errors
+    /// Returns [`ManagerError`] if domain placement fails.
+    pub fn place_control_plane(
+        &self,
+        target_pid: u32,
+        capacity: &ResolvedControlCapacity,
+    ) -> Result<PlacementOutcome, ManagerError> {
+        self.domain_controller
+            .place_control_plane(target_pid, capacity)
     }
 
     /// Returns the number of managed workers.
@@ -716,10 +774,11 @@ impl WorkerSupervisor {
         self.workers.get_mut(model_id)
     }
 
-    /// Spawns a new isolated compute worker for the specified model placement and attaches its arena.
+    /// Spawns a new isolated compute worker for the specified model placement,
+    /// attaches its arena, and enforces cgroup v2 or OS affinity isolation.
     ///
     /// # Errors
-    /// Returns [`ManagerError`] on spawn or IPC failure.
+    /// Returns [`ManagerError`] on spawn, IPC, or isolation domain placement failure.
     #[allow(clippy::missing_panics_doc)]
     pub fn spawn_worker(
         &mut self,
@@ -730,6 +789,10 @@ impl WorkerSupervisor {
         n_ctx: u32,
         max_blocks: u32,
     ) -> Result<&mut ManagedWorker, ManagerError> {
+        // Validate model identifier and resolve compute mask before spawning process
+        validate_model_id(&placement.model_id)?;
+        let compute_mask = resolve_worker_compute_mask(&placement)?;
+
         // If a worker with this model_id already exists, cleanly tear it down first
         if let Some(mut existing) = self.workers.remove(&placement.model_id) {
             let _ = existing.shutdown(false);
@@ -737,6 +800,22 @@ impl WorkerSupervisor {
 
         let (child, stream) =
             spawn_and_attach_process(&placement, &arena, arena_id, arena_bytes, n_ctx, max_blocks)?;
+
+        let pid = child.id();
+        let placement_outcome =
+            match self
+                .domain_controller
+                .place_worker(pid, &placement.model_id, compute_mask)
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let mut dead_child = child;
+                    let _ = dead_child.kill();
+                    let _ = dead_child.wait();
+                    let _ = fs::remove_file(&placement.socket_path);
+                    return Err(e);
+                }
+            };
 
         let model_id = placement.model_id.clone();
         let worker = ManagedWorker {
@@ -750,6 +829,7 @@ impl WorkerSupervisor {
             arena,
             generation: 1,
             is_alive: true,
+            last_placement_outcome: Some(placement_outcome),
         };
 
         self.workers.insert(model_id.clone(), worker);
@@ -817,6 +897,9 @@ impl WorkerSupervisor {
         worker.is_alive = false;
         worker.stream = None;
 
+        validate_model_id(&worker.placement.model_id)?;
+        let compute_mask = resolve_worker_compute_mask(&worker.placement)?;
+
         // 2. Spawn replacement worker and re-attach surviving arena via SCM_RIGHTS
         let (child, stream) = spawn_and_attach_process(
             &worker.placement,
@@ -827,10 +910,27 @@ impl WorkerSupervisor {
             worker.max_blocks,
         )?;
 
+        let pid = child.id();
+        let placement_outcome =
+            match self
+                .domain_controller
+                .place_worker(pid, &worker.placement.model_id, compute_mask)
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let mut dead_child = child;
+                    let _ = dead_child.kill();
+                    let _ = dead_child.wait();
+                    let _ = fs::remove_file(&worker.placement.socket_path);
+                    return Err(e);
+                }
+            };
+
         worker.child = Some(child);
         worker.stream = Some(stream);
         worker.generation += 1;
         worker.is_alive = true;
+        worker.last_placement_outcome = Some(placement_outcome);
 
         Ok(self.workers.get_mut(model_id).expect("worker exists"))
     }

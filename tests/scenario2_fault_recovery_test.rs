@@ -130,6 +130,20 @@ fn test_scenario2_fault_containment_and_clean_worker_restart() {
     assert_eq!(supervisor.worker_count(), 2);
     assert!(supervisor.is_worker_alive("model_a"));
     assert!(supervisor.is_worker_alive("model_b"));
+    assert!(
+        supervisor
+            .get_worker("model_a")
+            .unwrap()
+            .last_placement_outcome()
+            .is_some()
+    );
+    assert!(
+        supervisor
+            .get_worker("model_b")
+            .unwrap()
+            .last_placement_outcome()
+            .is_some()
+    );
 
     // ------------------------------------------------------------------------
     // Step 4: Execute forward passes on both models concurrently
@@ -207,6 +221,10 @@ fn test_scenario2_fault_containment_and_clean_worker_restart() {
     assert!(recovered_a.is_alive());
     assert_ne!(recovered_a.pid().unwrap(), pid_a); // New PID
     assert_eq!(recovered_a.generation(), 2); // Generation incremented
+    assert_eq!(
+        recovered_a.last_placement_outcome().unwrap().target_id,
+        recovered_a.pid().unwrap()
+    );
 
     // Verify preserved context in shared memory (ADR-026, ADR-042)
     let preserved_block_a0 = recovered_a.get_block_meta(0).expect("read recovered block");
