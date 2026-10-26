@@ -80,6 +80,7 @@ pub fn format_cpuset_list(mask: u64) -> Result<String, ManagerError> {
 ///
 /// Returns [`ManagerError::Affinity`] if the syntax is malformed, contains empty tokens,
 /// specifies cores `>= 16`, defines an inverted range (`start > end`), or results in a zero mask.
+#[allow(clippy::too_many_lines)]
 pub fn parse_cpuset_list(s: &str) -> Result<u64, ManagerError> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -102,14 +103,28 @@ pub fn parse_cpuset_list(s: &str) -> Result<u64, ManagerError> {
         }
 
         if let Some((start_str, end_str)) = t.split_once('-') {
-            let start: usize = start_str.trim().parse().map_err(|e| {
+            let s_trimmed = start_str.trim();
+            let e_trimmed = end_str.trim();
+            if s_trimmed.is_empty()
+                || !s_trimmed.chars().all(|c| c.is_ascii_digit())
+                || e_trimmed.is_empty()
+                || !e_trimmed.chars().all(|c| c.is_ascii_digit())
+            {
+                return Err(ManagerError::Affinity(K3Error::AffinityError {
+                    requested_mask: 0,
+                    requested_threads: 0,
+                    reason: format!("invalid range format '{t}' in cpuset '{trimmed}'"),
+                }));
+            }
+
+            let start: usize = s_trimmed.parse().map_err(|e| {
                 ManagerError::Affinity(K3Error::AffinityError {
                     requested_mask: 0,
                     requested_threads: 0,
                     reason: format!("invalid range start '{start_str}' in cpuset '{trimmed}': {e}"),
                 })
             })?;
-            let end: usize = end_str.trim().parse().map_err(|e| {
+            let end: usize = e_trimmed.parse().map_err(|e| {
                 ManagerError::Affinity(K3Error::AffinityError {
                     requested_mask: 0,
                     requested_threads: 0,
@@ -140,6 +155,16 @@ pub fn parse_cpuset_list(s: &str) -> Result<u64, ManagerError> {
                 mask |= 1 << core;
             }
         } else {
+            if !t.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ManagerError::Affinity(K3Error::AffinityError {
+                    requested_mask: 0,
+                    requested_threads: 0,
+                    reason: format!(
+                        "invalid core '{t}' in cpuset '{trimmed}': non-digit characters"
+                    ),
+                }));
+            }
+
             let core: usize = t.parse().map_err(|e| {
                 ManagerError::Affinity(K3Error::AffinityError {
                     requested_mask: 0,
@@ -183,16 +208,28 @@ pub fn parse_cpuset_list(s: &str) -> Result<u64, ManagerError> {
 /// or [`ManagerError::Affinity`] if the resolved mask is zero or out of bounds.
 pub fn resolve_worker_compute_mask(placement: &WorkerPlacement) -> Result<u64, ManagerError> {
     if let Some(ref aff_str) = placement.affinity {
-        let mask = if let Some(hex_str) = aff_str
+        let trimmed = aff_str.trim();
+        if trimmed.is_empty() {
+            return Err(ManagerError::WorkerSpawn(format!(
+                "invalid integer affinity '{aff_str}': empty string"
+            )));
+        }
+        if trimmed.starts_with('-') {
+            return Err(ManagerError::WorkerSpawn(format!(
+                "invalid integer affinity '{aff_str}': parse error"
+            )));
+        }
+
+        let mask = if let Some(hex_str) = trimmed
             .strip_prefix("0x")
-            .or_else(|| aff_str.strip_prefix("0X"))
+            .or_else(|| trimmed.strip_prefix("0X"))
         {
             u64::from_str_radix(hex_str, 16).map_err(|e| {
                 ManagerError::WorkerSpawn(format!("invalid hex affinity '{aff_str}': {e}"))
             })?
-        } else if let Ok(val) = aff_str.parse::<u64>() {
+        } else if let Ok(val) = trimmed.parse::<u64>() {
             val
-        } else if let Ok(val) = parse_cpuset_list(aff_str) {
+        } else if let Ok(val) = parse_cpuset_list(trimmed) {
             val
         } else {
             return Err(ManagerError::WorkerSpawn(format!(
@@ -228,7 +265,8 @@ pub fn resolve_worker_compute_mask(placement: &WorkerPlacement) -> Result<u64, M
 ///
 /// # Errors
 /// Returns [`ManagerError::WorkerSpawn`] if `model_id` is empty, whitespace-only,
-/// contains path separators (`/`, `\`), control characters, null bytes, or directory traversal (`..`, `.`).
+/// contains leading/trailing whitespace, path separators (`/`, `\`), control characters, null bytes,
+/// or directory traversal (`..`, `.`).
 pub fn validate_model_id(model_id: &str) -> Result<(), ManagerError> {
     let trimmed = model_id.trim();
     if trimmed.is_empty() {
@@ -236,15 +274,20 @@ pub fn validate_model_id(model_id: &str) -> Result<(), ManagerError> {
             "model_id cannot be empty".to_string(),
         ));
     }
+    if model_id != trimmed {
+        return Err(ManagerError::WorkerSpawn(format!(
+            "invalid model_id '{model_id}': cannot contain leading or trailing whitespace"
+        )));
+    }
     if trimmed == "."
         || trimmed == ".."
         || trimmed.contains('/')
         || trimmed.contains('\\')
         || trimmed.contains("..")
-        || trimmed.contains('\0')
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
     {
         return Err(ManagerError::WorkerSpawn(format!(
-            "invalid model_id '{model_id}': cannot contain path separators, control characters, or traversal components"
+            "invalid model_id '{model_id}': cannot contain path separators, whitespace, control characters, or traversal components"
         )));
     }
     Ok(())
@@ -350,6 +393,7 @@ impl CgroupFs for RealCgroupFs {
 #[derive(Debug, Default)]
 pub struct MockCgroupFs {
     files: Mutex<HashMap<PathBuf, Vec<u8>>>,
+    write_history: Mutex<Vec<(PathBuf, Vec<u8>)>>,
     created_dirs: Mutex<HashSet<PathBuf>>,
     error_injections: Mutex<HashMap<PathBuf, io::ErrorKind>>,
 }
@@ -361,6 +405,7 @@ impl MockCgroupFs {
     pub fn new() -> Self {
         Self {
             files: Mutex::new(HashMap::new()),
+            write_history: Mutex::new(Vec::new()),
             created_dirs: Mutex::new(HashSet::new()),
             error_injections: Mutex::new(HashMap::new()),
         }
@@ -390,6 +435,23 @@ impl MockCgroupFs {
             .expect("lock files")
             .get(path.as_ref())
             .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
+    }
+
+    /// Returns the write history as `(path, contents)` pairs in invocation order.
+    #[must_use]
+    pub fn write_history(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        self.write_history.lock().expect("lock history").clone()
+    }
+
+    /// Returns the sequence of written file paths in invocation order.
+    #[must_use]
+    pub fn written_paths(&self) -> Vec<PathBuf> {
+        self.write_history
+            .lock()
+            .expect("lock history")
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     /// Returns `true` if `path` was created as a directory.
@@ -453,6 +515,10 @@ impl CgroupFs for MockCgroupFs {
             .lock()
             .expect("lock files")
             .insert(path.to_path_buf(), contents.to_vec());
+        self.write_history
+            .lock()
+            .expect("lock history")
+            .push((path.to_path_buf(), contents.to_vec()));
         Ok(())
     }
 
@@ -749,11 +815,12 @@ impl CgroupV2DomainController {
         self.fs.create_dir_all(leaf_dir)?;
 
         // Enable +cpuset on intermediate cgroup ancestors between base_path and leaf_dir
+        // in strictly TOP-DOWN order per Linux cgroup v2 controller delegation constraints.
+        let mut ancestors = Vec::new();
         if let Some(parent) = leaf_dir.parent() {
             let mut curr = parent;
             while curr.starts_with(&self.base_path) {
-                let subtree_file = curr.join("cgroup.subtree_control");
-                let _ = self.fs.write(&subtree_file, b"+cpuset\n");
+                ancestors.push(curr.to_path_buf());
                 if curr == self.base_path {
                     break;
                 }
@@ -763,6 +830,12 @@ impl CgroupV2DomainController {
                     break;
                 }
             }
+        }
+        ancestors.reverse(); // Now strictly top-down: base_path down to leaf_dir.parent()
+
+        for anc in ancestors {
+            let subtree_file = anc.join("cgroup.subtree_control");
+            let _ = self.fs.write(&subtree_file, b"+cpuset\n");
         }
 
         let cpuset_file = leaf_dir.join("cpuset.cpus");
@@ -796,6 +869,13 @@ impl IsolationDomainController for CgroupV2DomainController {
         target_pid: u32,
         capacity: &ResolvedControlCapacity,
     ) -> Result<PlacementOutcome, ManagerError> {
+        if target_pid > (i32::MAX as u32) {
+            return Err(ManagerError::WorkerSpawn(format!(
+                "invalid target pid {target_pid}: must be 0 (current process) or positive 32-bit process ID (1..={})",
+                i32::MAX
+            )));
+        }
+
         let control_mask = if self.include_spare_in_control && capacity.spare_recovery_mask != 0 {
             capacity.active_control_mask | capacity.spare_recovery_mask
         } else {
@@ -859,10 +939,11 @@ impl IsolationDomainController for CgroupV2DomainController {
         compute_mask: u64,
     ) -> Result<PlacementOutcome, ManagerError> {
         validate_model_id(model_id)?;
-        if worker_pid == 0 {
-            return Err(ManagerError::WorkerSpawn(
-                "worker pid cannot be zero".to_string(),
-            ));
+        if worker_pid == 0 || worker_pid > (i32::MAX as u32) {
+            return Err(ManagerError::WorkerSpawn(format!(
+                "invalid worker pid {worker_pid}: must be a positive 32-bit process ID (1..={})",
+                i32::MAX
+            )));
         }
         if compute_mask == 0 {
             return Err(ManagerError::Affinity(K3Error::AffinityError {

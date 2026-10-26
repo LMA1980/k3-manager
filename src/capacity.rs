@@ -40,21 +40,28 @@ pub trait ResolvedControlCapacityExt {
 impl ResolvedControlCapacityExt for ResolvedControlCapacity {
     fn validate_worker_placement(&self, placement: &WorkerPlacement) -> Result<(), ManagerError> {
         if let Some(ref aff_str) = placement.affinity {
-            let mask = if let Some(hex_str) = aff_str
+            let trimmed = aff_str.trim();
+            if trimmed.starts_with('-') {
+                return Err(ManagerError::WorkerSpawn(format!(
+                    "invalid integer affinity '{aff_str}': parse error"
+                )));
+            }
+
+            let mask = if let Some(hex_str) = trimmed
                 .strip_prefix("0x")
-                .or_else(|| aff_str.strip_prefix("0X"))
+                .or_else(|| trimmed.strip_prefix("0X"))
             {
                 u64::from_str_radix(hex_str, 16).map_err(|e| {
                     ManagerError::WorkerSpawn(format!("invalid hex affinity '{aff_str}': {e}"))
                 })?
-            } else if let Ok(val) = aff_str.parse::<u64>() {
+            } else if let Ok(val) = trimmed.parse::<u64>() {
                 val
-            } else if let Ok(val) = parse_cpuset_list(aff_str) {
+            } else if let Ok(val) = parse_cpuset_list(trimmed) {
                 val
             } else {
-                aff_str.parse::<u64>().map_err(|e| {
-                    ManagerError::WorkerSpawn(format!("invalid integer affinity '{aff_str}': {e}"))
-                })?
+                return Err(ManagerError::WorkerSpawn(format!(
+                    "invalid integer affinity '{aff_str}': parse error"
+                )));
             };
 
             // If placement targets X100, ensure it does not overlap active control cores or exceed compute cap

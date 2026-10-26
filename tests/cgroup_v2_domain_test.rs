@@ -16,10 +16,10 @@ use std::sync::Arc;
 use k3_core::affinity::ControlPlaneCapacityConfig;
 use k3_manager::capacity::{
     CgroupV2DomainController, ControlPlaneScheduler, DomainPlacementMode, MockCgroupFs,
-    MockOsAffinityBackend, format_cpuset_list, parse_cpuset_list,
+    MockOsAffinityBackend, format_cpuset_list, parse_cpuset_list, resolve_worker_compute_mask,
 };
 use k3_manager::error::ManagerError;
-use k3_manager::supervisor::WorkerSupervisor;
+use k3_manager::supervisor::{WorkerPlacement, WorkerSupervisor};
 
 #[test]
 fn test_cpuset_list_formatting_and_parsing_roundtrip() {
@@ -484,6 +484,14 @@ fn test_model_id_validation_rejects_empty_and_traversal() {
         "org/model",
         "nested\\dir",
         "model\0null",
+        "model\ncontrol",
+        "model\rcontrol",
+        "model\tcontrol",
+        "model name",
+        " qwen2.5",
+        "qwen2.5 ",
+        "\x1b[31mmodel",
+        "model\x7f",
     ];
 
     for &bad_model in invalid_models {
@@ -503,18 +511,39 @@ fn test_model_id_validation_rejects_empty_and_traversal() {
 }
 
 #[test]
-fn test_place_worker_rejects_worker_pid_zero() {
+fn test_place_worker_rejects_worker_pid_zero_and_overflow() {
     let fs = Arc::new(MockCgroupFs::new());
     let aff = Arc::new(MockOsAffinityBackend::new());
     let controller = CgroupV2DomainController::new("/mock/cgroup")
         .with_fs(fs.clone())
         .with_affinity_backend(aff.clone());
 
-    let err = controller
+    // Worker PID 0 must be rejected
+    let err_zero = controller
         .place_worker(0, "qwen2.5-7b", 0x003F)
         .expect_err("worker pid 0 must be rejected");
+    assert!(matches!(err_zero, ManagerError::WorkerSpawn(_)));
 
-    assert!(matches!(err, ManagerError::WorkerSpawn(_)));
+    // Worker PID exceeding positive i32 bound must be rejected
+    let err_overflow = controller
+        .place_worker(u32::MAX, "qwen2.5-7b", 0x003F)
+        .expect_err("worker pid u32::MAX must be rejected");
+    assert!(matches!(err_overflow, ManagerError::WorkerSpawn(_)));
+
+    let err_i32_plus_one = controller
+        .place_worker((i32::MAX as u32) + 1, "qwen2.5-7b", 0x003F)
+        .expect_err("worker pid i32::MAX + 1 must be rejected");
+    assert!(matches!(err_i32_plus_one, ManagerError::WorkerSpawn(_)));
+
+    // Target PID overflow in place_control_plane must also be rejected
+    let cap = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("capacity");
+    let err_ctrl_overflow = controller
+        .place_control_plane(u32::MAX, &cap)
+        .expect_err("target pid u32::MAX must be rejected");
+    assert!(matches!(err_ctrl_overflow, ManagerError::WorkerSpawn(_)));
+
     assert_eq!(fs.created_dirs().len(), 0);
     assert_eq!(aff.calls().len(), 0);
 }
@@ -615,6 +644,95 @@ fn test_cgroup_v2_subtree_control_intermediate_ancestors() {
             .as_deref(),
         Some("+cpuset\n")
     );
+
+    // Verify strictly TOP-DOWN write order: root ancestor -> engines ancestor -> leaf cpuset -> leaf procs
+    let paths = fs.written_paths();
+    let root_idx = paths
+        .iter()
+        .position(|p| p == &PathBuf::from("/mock/cgroup/cgroup.subtree_control"))
+        .expect("root subtree control written");
+    let engines_idx = paths
+        .iter()
+        .position(|p| p == &PathBuf::from("/mock/cgroup/engines/cgroup.subtree_control"))
+        .expect("engines subtree control written");
+    let cpuset_idx = paths
+        .iter()
+        .position(|p| p == &PathBuf::from("/mock/cgroup/engines/qwen2.5/cpuset.cpus"))
+        .expect("cpuset.cpus written");
+    let procs_idx = paths
+        .iter()
+        .position(|p| p == &PathBuf::from("/mock/cgroup/engines/qwen2.5/cgroup.procs"))
+        .expect("cgroup.procs written");
+
+    assert!(
+        root_idx < engines_idx,
+        "root ancestor must be enabled BEFORE engines intermediate cgroup (top-down rule)"
+    );
+    assert!(
+        engines_idx < cpuset_idx,
+        "engines subtree control must be enabled BEFORE leaf cpuset.cpus write"
+    );
+    assert!(
+        cpuset_idx < procs_idx,
+        "cpuset.cpus must be written BEFORE cgroup.procs migration"
+    );
+}
+
+#[test]
+fn test_parse_cpuset_list_rejects_non_digit_plus_signs_and_malformed_ranges() {
+    let rejected = &["+0", "0-+5", "+0-5", "-1", "1-", "0-1-2", "--", "+1,4"];
+
+    for &bad in rejected {
+        let res = parse_cpuset_list(bad);
+        assert!(
+            res.is_err(),
+            "expected rejection for '{bad}', but got: {res:?}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_cpuset_list_error_diagnostics_and_worker_mask_resolution() {
+    let dummy_weights = PathBuf::from("/tmp/weights.gguf");
+    let dummy_socket = PathBuf::from("/tmp/sock.sock");
+
+    // 1. parse_cpuset_list directly returns detailed AffinityError diagnostics
+    let err_oob = parse_cpuset_list("0-16").unwrap_err();
+    match err_oob {
+        ManagerError::Affinity(k3_err) => {
+            assert!(
+                k3_err.to_string().contains("16"),
+                "expected core 16 diagnostic in {k3_err}"
+            );
+        }
+        other => panic!("expected ManagerError::Affinity, got {other:?}"),
+    }
+
+    let err_inv = parse_cpuset_list("5-3").unwrap_err();
+    match err_inv {
+        ManagerError::Affinity(k3_err) => {
+            assert!(
+                k3_err.to_string().contains("inverted"),
+                "expected inverted range diagnostic in {k3_err}"
+            );
+        }
+        other => panic!("expected ManagerError::Affinity, got {other:?}"),
+    }
+
+    // 2. resolve_worker_compute_mask rejects invalid cpuset strings with WorkerSpawn
+    let mut p_oob = WorkerPlacement::new("m", &dummy_weights, &dummy_socket, "x100");
+    p_oob.affinity = Some("0-16".to_string());
+    assert!(matches!(
+        resolve_worker_compute_mask(&p_oob).unwrap_err(),
+        ManagerError::WorkerSpawn(_)
+    ));
+
+    let mut p_inv = WorkerPlacement::new("m", &dummy_weights, &dummy_socket, "x100");
+    p_inv.affinity = Some("5-3".to_string());
+    assert!(matches!(
+        resolve_worker_compute_mask(&p_inv).unwrap_err(),
+        ManagerError::WorkerSpawn(_)
+    ));
 }
 
 #[test]
