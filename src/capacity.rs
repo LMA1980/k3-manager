@@ -38,7 +38,49 @@ pub trait ResolvedControlCapacityExt {
 }
 
 impl ResolvedControlCapacityExt for ResolvedControlCapacity {
+    #[allow(clippy::too_many_lines)]
     fn validate_worker_placement(&self, placement: &WorkerPlacement) -> Result<(), ManagerError> {
+        // 1. Validate requested thread count bounds upfront
+        if let Some(threads) = placement.threads {
+            if threads == 0 {
+                return Err(ManagerError::Affinity(K3Error::AffinityError {
+                    requested_mask: 0,
+                    requested_threads: 0,
+                    reason: format!(
+                        "worker placement on '{0}' requested 0 threads; must be greater than 0",
+                        placement.model_id
+                    ),
+                }));
+            }
+
+            if placement.cluster.eq_ignore_ascii_case("x100")
+                && threads as usize > self.x100_max_compute_cores
+            {
+                return Err(ManagerError::Affinity(K3Error::AffinityError {
+                    requested_mask: self.x100_compute_cap_mask,
+                    requested_threads: threads as usize,
+                    reason: format!(
+                        "worker placement on '{0}' requests {threads} threads, exceeding X100 max compute limit {1}",
+                        placement.model_id, self.x100_max_compute_cores
+                    ),
+                }));
+            }
+
+            if placement.cluster.eq_ignore_ascii_case("a100")
+                && threads as usize > self.a100_max_compute_cores
+            {
+                return Err(ManagerError::Affinity(K3Error::AffinityError {
+                    requested_mask: A100_CLUSTER_MASK,
+                    requested_threads: threads as usize,
+                    reason: format!(
+                        "worker placement on '{0}' requests {threads} threads, exceeding A100 max compute limit {1}",
+                        placement.model_id, self.a100_max_compute_cores
+                    ),
+                }));
+            }
+        }
+
+        // 2. Validate explicit affinity specification if provided
         if let Some(ref aff_str) = placement.affinity {
             let trimmed = aff_str.trim();
             if trimmed.starts_with('-') {
@@ -86,6 +128,42 @@ impl ResolvedControlCapacityExt for ResolvedControlCapacity {
                         reason: format!(
                             "worker placement on '{0}' exceeds X100 compute cap mask 0x{1:04X}",
                             placement.model_id, self.x100_compute_cap_mask
+                        ),
+                    }));
+                }
+            } else if placement.cluster.eq_ignore_ascii_case("a100") {
+                if (mask & self.active_control_mask) != 0 {
+                    return Err(ManagerError::Affinity(K3Error::AffinityError {
+                        requested_mask: mask,
+                        requested_threads: mask.count_ones() as usize,
+                        reason: format!(
+                            "worker placement on '{0}' encroaches on dedicated active control cores 0x{1:04X}",
+                            placement.model_id, self.active_control_mask
+                        ),
+                    }));
+                }
+
+                if (mask & !A100_CLUSTER_MASK) != 0 {
+                    return Err(ManagerError::Affinity(K3Error::AffinityError {
+                        requested_mask: mask,
+                        requested_threads: mask.count_ones() as usize,
+                        reason: format!(
+                            "worker placement on '{0}' targets cluster 'a100' but specifies cores outside A100 mask 0x{A100_CLUSTER_MASK:04X}",
+                            placement.model_id
+                        ),
+                    }));
+                }
+            }
+
+            if let Some(threads) = placement.threads {
+                if mask != 0 && threads as usize > mask.count_ones() as usize {
+                    return Err(ManagerError::Affinity(K3Error::AffinityError {
+                        requested_mask: mask,
+                        requested_threads: threads as usize,
+                        reason: format!(
+                            "worker placement on '{0}' requests {threads} threads, exceeding {1} available cores in affinity mask 0x{mask:04X}",
+                            placement.model_id,
+                            mask.count_ones()
                         ),
                     }));
                 }

@@ -21,8 +21,9 @@ use std::sync::Arc;
 use std::thread;
 
 use k3_core::K3Error;
+use k3_core::ipc::shm::SharedMemoryArena;
 use k3_manager::error::ManagerError;
-use k3_manager::supervisor::WorkerPlacement;
+use k3_manager::supervisor::{WorkerPlacement, WorkerSupervisor};
 use k3_manager::{
     A100_CLUSTER_MASK, ControlPlaneCapacityConfig, ControlPlaneScheduler,
     DEFAULT_ACTIVE_CONTROL_MASK, DEFAULT_SPARE_RECOVERY_MASK, DEFAULT_X100_COMPUTE_CAP_MASK,
@@ -239,4 +240,128 @@ fn test_manager_scheduler_capacity_accessor() {
     assert_eq!(scheduler.capacity().active_control_mask, 0x00C0);
     assert_eq!(scheduler.capacity().spare_recovery_mask, 0x0020);
     assert_eq!(scheduler.capacity().x100_compute_cap_mask, 0x003F);
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_exceeding_x100_thread_cap() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("thread_cap_test_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Requesting 7 threads on X100 exceeds the 6-thread cap (cores 0..5, 0x003F)
+    let placement = WorkerPlacement::new("model_7threads", &dummy_weights, &dummy_socket, "x100")
+        .with_threads(7);
+
+    let dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    let err = supervisor
+        .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+        .unwrap_err();
+
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    let err_str = format!("{err}");
+    assert!(err_str.contains("exceeding X100 max compute limit 6"));
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_active_control_encroachment() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("encroach_test_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Attempting to spawn worker requesting cores 6 or 7 (0x00C0, 0x0040, 0x0080, 0x00FF)
+    for bad_aff in &["0x0040", "0x0080", "0x00C0", "0x00FF"] {
+        let placement = WorkerPlacement::new("rogue_model", &dummy_weights, &dummy_socket, "x100")
+            .with_affinity(*bad_aff);
+
+        let dup_arena = arena
+            .duplicate_fd()
+            .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+            .expect("dup arena");
+
+        let err = supervisor
+            .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+            .unwrap_err();
+
+        assert!(matches!(err, ManagerError::Affinity(_)));
+        let err_str = format!("{err}");
+        assert!(err_str.contains("encroaches on dedicated active control cores 0x00C0"));
+    }
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_exceeding_a100_thread_cap() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("a100_cap_test_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    // Requesting 9 threads on A100 exceeds the 8-thread compute limit
+    let placement = WorkerPlacement::new("model_9threads", &dummy_weights, &dummy_socket, "a100")
+        .with_threads(9);
+
+    let dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    let err = supervisor
+        .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+        .unwrap_err();
+
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    let err_str = format!("{err}");
+    assert!(err_str.contains("exceeding A100 max compute limit 8"));
+}
+
+#[test]
+fn test_supervisor_spawn_worker_rejects_zero_threads() {
+    let dummy_weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let dummy_socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+    let arena = SharedMemoryArena::create("zero_threads_arena", 4096).expect("create arena");
+    let mut supervisor = WorkerSupervisor::new();
+
+    let placement = WorkerPlacement::new("model_0threads", &dummy_weights, &dummy_socket, "x100")
+        .with_threads(0);
+
+    let dup_arena = arena
+        .duplicate_fd()
+        .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+        .expect("dup arena");
+
+    let err = supervisor
+        .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+        .unwrap_err();
+
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    let err_str = format!("{err}");
+    assert!(err_str.contains("must be greater than 0"));
+}
+
+#[test]
+fn test_worker_placement_thread_validation() {
+    let cfg = ControlPlaneCapacityConfig::default();
+    let res = cfg.resolve_default().expect("default resolution");
+    let weights = std::path::PathBuf::from("/tmp/dummy_weights.gguf");
+    let socket = std::path::PathBuf::from("/tmp/dummy_socket.sock");
+
+    // Valid 6 threads on X100
+    let valid_x100 = WorkerPlacement::new("m1", &weights, &socket, "x100").with_threads(6);
+    assert!(res.validate_worker_placement(&valid_x100).is_ok());
+
+    // Valid 8 threads on A100
+    let valid_a100 = WorkerPlacement::new("m2", &weights, &socket, "a100").with_threads(8);
+    assert!(res.validate_worker_placement(&valid_a100).is_ok());
+
+    // Threads exceeding mask count
+    let mut excess_threads = WorkerPlacement::new("m3", &weights, &socket, "x100").with_threads(4);
+    excess_threads.affinity = Some("0x0003".to_string()); // only 2 cores
+    let err = res.validate_worker_placement(&excess_threads).unwrap_err();
+    assert!(matches!(err, ManagerError::Affinity(_)));
+    assert!(format!("{err}").contains("exceeding 2 available cores in affinity mask 0x0003"));
 }
