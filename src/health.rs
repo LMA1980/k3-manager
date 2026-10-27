@@ -297,6 +297,10 @@ impl HealthSupervisor {
     #[must_use]
     pub fn is_watchdog_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+            && self
+                .watchdog_handle
+                .as_ref()
+                .is_none_or(|h| !h.is_finished())
     }
 
     /// Starts the dedicated spare recovery watchdog thread pinned to `spare_recovery_mask`.
@@ -304,8 +308,12 @@ impl HealthSupervisor {
     /// # Errors
     /// Returns [`ManagerError`] if watchdog thread spawning or core affinity application fails.
     pub fn start_watchdog(&mut self) -> Result<(), ManagerError> {
-        if self.running.load(Ordering::Relaxed) {
+        if self.is_watchdog_running() {
             return Ok(());
+        }
+
+        if let Some(old_handle) = self.watchdog_handle.take() {
+            let _ = old_handle.join();
         }
 
         let spare_mask = self.config.spare_recovery_mask;
@@ -336,9 +344,16 @@ impl HealthSupervisor {
                 }
 
                 while running.load(Ordering::Relaxed) {
-                    Self::perform_health_check(ws_opt.as_ref(), rt_opt.as_ref(), &audit_events);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::perform_health_check(
+                            ws_opt.as_ref(),
+                            rt_opt.as_ref(),
+                            &audit_events,
+                        );
+                    }));
                     std::thread::sleep(check_interval);
                 }
+                running.store(false, Ordering::SeqCst);
             })
             .map_err(|e| {
                 ManagerError::WorkerSpawn(format!(
@@ -480,6 +495,8 @@ impl HealthSupervisor {
                     if let Some(worker) = ws.get_worker_mut(&model_id) {
                         if worker.is_alive() {
                             let _ = worker.kill(libc::SIGTERM);
+                            // Also send SIGCONT so stopped/paused workers receive SIGTERM immediately
+                            let _ = worker.kill(libc::SIGCONT);
                             let start_kill = Instant::now();
                             while worker.is_alive()
                                 && start_kill.elapsed() < Duration::from_millis(50)
@@ -523,6 +540,9 @@ impl HealthSupervisor {
                             eprintln!(
                                 "[health supervisor] failed to recover worker '{model_id}': {e}"
                             );
+                            if let Some(rt) = control_runtime {
+                                rt.update_worker_health(&model_id, false, 0);
+                            }
                         }
                     }
                 }

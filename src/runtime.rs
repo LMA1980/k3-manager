@@ -197,7 +197,7 @@ impl ControlPlaneRuntime {
 
         for &core_id in &active_cores {
             let (tx, rx) = channel::<Box<dyn FnOnce(usize) + Send>>();
-            let (ready_tx, ready_rx) = sync_channel::<()>(1);
+            let (ready_tx, ready_rx) = sync_channel::<Result<(), ManagerError>>(1);
             let backend_clone = Arc::clone(&affinity_backend);
             let thread_name = format!("k3-control-{core_id}");
 
@@ -206,8 +206,12 @@ impl ControlPlaneRuntime {
                 .spawn(move || {
                     // Apply OS affinity for this active control core (ADR-007, ADR-041)
                     let mask = 1_u64 << core_id;
-                    let _ = backend_clone.set_affinity(0, mask);
-                    let _ = ready_tx.send(());
+                    let aff_res = backend_clone.set_affinity(0, mask);
+                    let is_ok = aff_res.is_ok();
+                    let _ = ready_tx.send(aff_res);
+                    if !is_ok {
+                        return;
+                    }
 
                     while let Ok(task) = rx.recv() {
                         task(core_id);
@@ -220,7 +224,19 @@ impl ControlPlaneRuntime {
                 })?;
 
             // Await thread initialization and affinity application
-            let _ = ready_rx.recv();
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let _ = handle.join();
+                    return Err(e);
+                }
+                Err(_) => {
+                    let _ = handle.join();
+                    return Err(ManagerError::WorkerSpawn(format!(
+                        "control worker thread for core {core_id} panicked during initialization"
+                    )));
+                }
+            }
 
             control_workers.push(ControlWorkerThread {
                 core_id,
@@ -366,7 +382,7 @@ impl ControlPlaneRuntime {
     /// Returns [`ManagerError`] if thread spawning fails.
     pub fn replace_worker_thread(&self, core_id: usize) -> Result<(), ManagerError> {
         let (tx, rx) = channel::<Box<dyn FnOnce(usize) + Send>>();
-        let (ready_tx, ready_rx) = sync_channel::<()>(1);
+        let (ready_tx, ready_rx) = sync_channel::<Result<(), ManagerError>>(1);
         let backend_clone = Arc::clone(&self.affinity_backend);
         let thread_name = format!("k3-control-{core_id}-replaced");
 
@@ -374,8 +390,12 @@ impl ControlPlaneRuntime {
             .name(thread_name)
             .spawn(move || {
                 let mask = 1_u64 << core_id;
-                let _ = backend_clone.set_affinity(0, mask);
-                let _ = ready_tx.send(());
+                let aff_res = backend_clone.set_affinity(0, mask);
+                let is_ok = aff_res.is_ok();
+                let _ = ready_tx.send(aff_res);
+                if !is_ok {
+                    return;
+                }
 
                 while let Ok(task) = rx.recv() {
                     task(core_id);
@@ -387,7 +407,19 @@ impl ControlPlaneRuntime {
                 ))
             })?;
 
-        let _ = ready_rx.recv();
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = handle.join();
+                return Err(ManagerError::WorkerSpawn(format!(
+                    "replacement control worker thread for core {core_id} panicked during initialization"
+                )));
+            }
+        }
 
         let mut workers = self
             .control_workers
@@ -525,6 +557,7 @@ impl ControlPlaneRuntime {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
             tasks.remove(&task_id);
+            let _ = self.replace_worker_thread(core_id);
             return Err(ManagerError::WorkerIpc(
                 "control worker thread is dead".to_owned(),
             ));

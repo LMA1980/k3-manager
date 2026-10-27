@@ -412,3 +412,84 @@ fn test_sub_issue_76_check_once_detects_unresponsive_worker_and_recovers() {
 
     let _ = worker_stall.join();
 }
+
+#[test]
+fn test_sub_issue_76_control_plane_runtime_affinity_failure_propagates_error() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    // Configure affinity to fail on PID 0
+    mock_affinity.fail_pid(0);
+
+    let rt_res = ControlPlaneRuntime::with_affinity_backend(
+        capacity,
+        Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>,
+    );
+
+    assert!(
+        rt_res.is_err(),
+        "control plane runtime creation must fail when affinity fails"
+    );
+    match rt_res.unwrap_err() {
+        ManagerError::Affinity(_) => {}
+        other => panic!("expected ManagerError::Affinity, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_sub_issue_75_managed_worker_dispatch_forward_pass_alias() {
+    let (mgr_sock, dummy_worker) = UnixStream::pair().expect("socketpair");
+    let arena = init_dummy_arena("shm_alias_test");
+
+    let placement = WorkerPlacement::new("test-alias", "/dummy", "/dummy.sock", "x100")
+        .with_pass_timeout(Duration::from_millis(50));
+
+    let mut worker = ManagedWorker::create_test_worker(placement, mgr_sock, arena, 1, 65536, 64, 4);
+
+    let dummy_thread = std::thread::spawn(move || {
+        let (msg, _) = recv_msg_frame(&dummy_worker).expect("receive");
+        assert!(matches!(msg, IpcMessage::ForwardPassCommand(_)));
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = dummy_worker;
+    });
+
+    let req = ForwardPassRequest::new_prefill(5001, 1, vec![1, 2, 3], vec![0]);
+    let res = worker.dispatch_forward_pass(&req);
+    assert!(
+        res.is_err(),
+        "dispatch_forward_pass must return error on timeout"
+    );
+    match res.unwrap_err() {
+        ManagerError::WorkerUnresponsive {
+            model_id,
+            elapsed_ms,
+            ..
+        } => {
+            assert_eq!(model_id, "test-alias");
+            assert!(elapsed_ms >= 30);
+        }
+        other => panic!("expected WorkerUnresponsive, got {other:?}"),
+    }
+
+    let _ = dummy_thread.join();
+}
+
+#[test]
+fn test_sub_issue_76_non_terminating_signals_preserve_worker_stream_and_liveness() {
+    let (mgr_sock, _dummy_worker) = UnixStream::pair().expect("socketpair");
+    let arena = init_dummy_arena("shm_sig_test");
+
+    let placement = WorkerPlacement::new("test-sig", "/dummy", "/dummy.sock", "x100");
+    let mut worker = ManagedWorker::create_test_worker(placement, mgr_sock, arena, 1, 65536, 64, 4);
+
+    assert!(worker.is_alive());
+
+    // Sending non-terminating signals like SIGSTOP and SIGCONT should preserve liveness
+    worker.kill(libc::SIGSTOP).expect("send SIGSTOP");
+    assert!(worker.is_alive());
+
+    worker.kill(libc::SIGCONT).expect("send SIGCONT");
+    assert!(worker.is_alive());
+}

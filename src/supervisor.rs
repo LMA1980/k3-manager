@@ -353,7 +353,10 @@ impl ManagedWorker {
     pub fn is_alive(&mut self) -> bool {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
-                Ok(None) => true,
+                Ok(None) => {
+                    self.is_alive = true;
+                    true
+                }
                 Ok(Some(_status)) => {
                     self.is_alive = false;
                     false
@@ -373,6 +376,18 @@ impl ManagedWorker {
     /// # Errors
     /// Returns [`ManagerError::WorkerIpc`] if sending signal fails.
     pub fn kill(&mut self, signal: libc::c_int) -> Result<(), ManagerError> {
+        let is_non_terminating = matches!(
+            signal,
+            libc::SIGSTOP
+                | libc::SIGCONT
+                | libc::SIGTSTP
+                | libc::SIGTTIN
+                | libc::SIGTTOU
+                | libc::SIGCHLD
+                | libc::SIGWINCH
+                | libc::SIGURG
+        );
+
         if let Some(child) = &mut self.child {
             let pid = child.id();
             // SAFETY: kill sends standard signal to supervised child pid.
@@ -384,8 +399,8 @@ impl ManagedWorker {
                 )));
             }
 
-            if signal == libc::SIGSTOP {
-                // Suspended process remains alive in OS; stream remains open
+            if is_non_terminating {
+                // Non-terminating signal: process remains alive in OS; stream remains open
                 return Ok(());
             }
 
@@ -407,7 +422,7 @@ impl ManagedWorker {
 
             Ok(())
         } else {
-            if signal == libc::SIGSTOP {
+            if is_non_terminating {
                 return Ok(());
             }
             self.is_alive = false;
@@ -646,6 +661,19 @@ impl ManagedWorker {
                 Err(e)
             }
         }
+    }
+
+    /// Dispatches a zero-copy forward pass to this worker with deadline-bounded timeout.
+    ///
+    /// Alias for [`execute_forward_pass`](Self::execute_forward_pass) fulfilling US-06.3 (#75) requirements.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError::WorkerUnresponsive`] if pass times out, or [`ManagerError`] on failure.
+    pub fn dispatch_forward_pass(
+        &mut self,
+        req: &ForwardPassRequest,
+    ) -> Result<ForwardPassResult, ManagerError> {
+        self.execute_forward_pass(req)
     }
 
     // ========================================================================

@@ -389,6 +389,13 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
                 "encroachment detected: worker {pid} was assigned mask 0x{mask:04X}"
             );
         }
+        if (mask & 0x003F) != 0 {
+            assert_eq!(
+                mask & 0x00C0,
+                0,
+                "compute thread mask 0x{mask:04X} encroached onto active control cores 0x00C0"
+            );
+        }
     }
 
     // Cleanly shutdown worker
