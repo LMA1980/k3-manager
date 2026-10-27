@@ -168,6 +168,11 @@ fn test_scenario2_runaway_workload_recovery_e2e() {
     tok.add_token("hello", 1);
     tok.add_token("recovery", 2);
     control_runtime.register_tokenizer("model-control", Arc::new(tok));
+    control_runtime.record_model_placement(
+        model_id.to_owned(),
+        "x100".to_owned(),
+        Some(initial_pid),
+    );
 
     let ws_arc = Arc::new(Mutex::new(supervisor));
 
@@ -251,6 +256,22 @@ fn test_scenario2_runaway_workload_recovery_e2e() {
         assert_eq!(rep_worker.generation(), 2);
         assert_ne!(rep_worker.pid(), Some(initial_pid));
         assert_eq!(rep_worker.pid(), new_worker_pid);
+
+        // Verify control-plane status plane reflects replacement worker PID and generation 2
+        let health_snaps = control_runtime.worker_health_snapshots();
+        let model_snap = health_snaps
+            .iter()
+            .find(|s| s.model_id == model_id)
+            .expect("model health snapshot present");
+        assert!(model_snap.is_alive, "model snapshot must report alive");
+        assert_eq!(
+            model_snap.pid, new_worker_pid,
+            "model snapshot PID must be updated to new replacement worker PID"
+        );
+        assert_eq!(
+            model_snap.generation, 2,
+            "model snapshot generation must be incremented to 2"
+        );
 
         // Verify surviving k3-kv arena context is preserved intact
         let block0_after_recovery = rep_worker.get_block_meta(0).expect("read block 0");

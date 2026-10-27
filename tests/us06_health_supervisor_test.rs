@@ -493,3 +493,117 @@ fn test_sub_issue_76_non_terminating_signals_preserve_worker_stream_and_liveness
     worker.kill(libc::SIGCONT).expect("send SIGCONT");
     assert!(worker.is_alive());
 }
+
+#[derive(Debug)]
+struct PanickingOsAffinityBackend;
+
+impl k3_manager::OsAffinityBackend for PanickingOsAffinityBackend {
+    fn set_affinity(&self, _pid: u32, _mask: u64) -> Result<(), ManagerError> {
+        panic!("simulated panic inside affinity backend during thread initialization");
+    }
+}
+
+#[test]
+fn test_sub_issue_76_watchdog_thread_initialization_panic_propagates_error() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+
+    let mut supervisor =
+        HealthSupervisor::with_affinity_backend(capacity, Arc::new(PanickingOsAffinityBackend))
+            .expect("health supervisor");
+
+    let res = supervisor.start_watchdog();
+    assert!(res.is_err(), "thread initialization panic must return Err");
+    match res.unwrap_err() {
+        ManagerError::WorkerSpawn(msg) => {
+            assert!(msg.contains("panicked during initialization"));
+        }
+        other => panic!("expected WorkerSpawn, got {other:?}"),
+    }
+    assert!(!supervisor.is_watchdog_running());
+}
+
+#[test]
+fn test_sub_issue_76_supervisor_config_timeouts_applied_to_worker_health_checks() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let supervisor = HealthSupervisor::with_affinity_backend(
+        capacity,
+        Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>,
+    )
+    .expect("health supervisor")
+    .with_heartbeat_timeout(Duration::from_millis(77))
+    .with_pass_timeout(Duration::from_millis(88));
+
+    assert_eq!(
+        supervisor.config().heartbeat_timeout,
+        Duration::from_millis(77)
+    );
+    assert_eq!(supervisor.config().pass_timeout, Duration::from_millis(88));
+}
+
+#[test]
+fn test_sub_issue_76_worker_health_snapshot_updates_pid_on_recovery() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let runtime = ControlPlaneRuntime::with_affinity_backend(
+        capacity,
+        Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>,
+    )
+    .expect("runtime creation");
+
+    runtime.record_model_placement("model-snap".to_owned(), "x100".to_owned(), Some(1234));
+    let initial_snap = runtime
+        .worker_health_snapshots()
+        .into_iter()
+        .find(|s| s.model_id == "model-snap")
+        .expect("snapshot exists");
+    assert_eq!(initial_snap.pid, Some(1234));
+    assert_eq!(initial_snap.generation, 1);
+
+    // Update with new PID and generation after recovery
+    runtime.update_worker_health_with_pid("model-snap", Some(5678), true, 2);
+
+    let updated_snap = runtime
+        .worker_health_snapshots()
+        .into_iter()
+        .find(|s| s.model_id == "model-snap")
+        .expect("snapshot exists");
+    assert_eq!(updated_snap.pid, Some(5678));
+    assert_eq!(updated_snap.generation, 2);
+    assert!(updated_snap.is_alive);
+
+    // Update when recovery fails (None pid, is_alive false)
+    runtime.update_worker_health_with_pid("model-snap", None, false, 0);
+    let dead_snap = runtime
+        .worker_health_snapshots()
+        .into_iter()
+        .find(|s| s.model_id == "model-snap")
+        .expect("snapshot exists");
+    assert_eq!(dead_snap.pid, None);
+    assert!(!dead_snap.is_alive);
+}
+
+#[test]
+fn test_sub_issue_75_worker_supervisor_dispatch_forward_pass_alias() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+
+    let mut supervisor = WorkerSupervisor::new().with_capacity(capacity);
+    let req = ForwardPassRequest::new_prefill(1, 1, vec![1, 2], vec![0]);
+
+    let res = supervisor.dispatch_forward_pass("non-existent-model", &req);
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        ManagerError::ModelNotFound(m) => assert_eq!(m, "non-existent-model"),
+        other => panic!("expected ModelNotFound, got {other:?}"),
+    }
+}
