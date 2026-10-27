@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::capacity::ControlPlaneScheduler;
 use crate::domain::{OsAffinityBackend, RealOsAffinityBackend};
@@ -109,6 +110,39 @@ pub enum AdminResponse {
     ModelUnregistered(String),
 }
 
+/// Default control task lease duration (5 seconds).
+pub const DEFAULT_CONTROL_TASK_LEASE: Duration = Duration::from_secs(5);
+
+/// Active control-plane task lease metadata.
+#[derive(Debug)]
+pub struct ActiveTaskRecord {
+    /// Unique task identifier.
+    pub task_id: u64,
+    /// Physical core ID where task was dispatched.
+    pub core_id: usize,
+    /// Start timestamp of task execution.
+    pub start_time: Instant,
+    /// Lease expiration deadline.
+    pub deadline: Instant,
+    /// Cooperative cancellation token.
+    pub cancellation_token: Arc<AtomicBool>,
+}
+
+/// Snapshot of an active control task lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLeaseSnapshot {
+    /// Unique task identifier.
+    pub task_id: u64,
+    /// Core index where task was scheduled.
+    pub core_id: usize,
+    /// Elapsed execution time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Remaining lease time in milliseconds (negative if expired).
+    pub remaining_ms: i64,
+    /// Whether cooperative cancellation has been requested.
+    pub is_cancelled: bool,
+}
+
 struct ControlWorkerThread {
     core_id: usize,
     sender: Sender<Box<dyn FnOnce(usize) + Send>>,
@@ -132,7 +166,10 @@ pub struct ControlPlaneRuntime {
     prompt_orchestrator: Arc<PromptOrchestrator>,
     queue_depth: Arc<AtomicUsize>,
     placements: Arc<RwLock<HashMap<String, ModelPlacementRecord>>>,
-    control_workers: Vec<ControlWorkerThread>,
+    control_workers: Arc<RwLock<Vec<ControlWorkerThread>>>,
+    active_tasks: Arc<RwLock<HashMap<u64, ActiveTaskRecord>>>,
+    next_task_id: Arc<AtomicU64>,
+    default_lease_duration: Arc<RwLock<Duration>>,
 }
 
 impl ControlPlaneRuntime {
@@ -160,7 +197,7 @@ impl ControlPlaneRuntime {
 
         for &core_id in &active_cores {
             let (tx, rx) = channel::<Box<dyn FnOnce(usize) + Send>>();
-            let (ready_tx, ready_rx) = sync_channel::<()>(1);
+            let (ready_tx, ready_rx) = sync_channel::<Result<(), ManagerError>>(1);
             let backend_clone = Arc::clone(&affinity_backend);
             let thread_name = format!("k3-control-{core_id}");
 
@@ -169,8 +206,12 @@ impl ControlPlaneRuntime {
                 .spawn(move || {
                     // Apply OS affinity for this active control core (ADR-007, ADR-041)
                     let mask = 1_u64 << core_id;
-                    let _ = backend_clone.set_affinity(0, mask);
-                    let _ = ready_tx.send(());
+                    let aff_res = backend_clone.set_affinity(0, mask);
+                    let is_ok = aff_res.is_ok();
+                    let _ = ready_tx.send(aff_res);
+                    if !is_ok {
+                        return;
+                    }
 
                     while let Ok(task) = rx.recv() {
                         task(core_id);
@@ -183,7 +224,19 @@ impl ControlPlaneRuntime {
                 })?;
 
             // Await thread initialization and affinity application
-            let _ = ready_rx.recv();
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let _ = handle.join();
+                    return Err(e);
+                }
+                Err(_) => {
+                    let _ = handle.join();
+                    return Err(ManagerError::WorkerSpawn(format!(
+                        "control worker thread for core {core_id} panicked during initialization"
+                    )));
+                }
+            }
 
             control_workers.push(ControlWorkerThread {
                 core_id,
@@ -199,14 +252,21 @@ impl ControlPlaneRuntime {
             prompt_orchestrator: Arc::new(PromptOrchestrator::new()),
             queue_depth: Arc::new(AtomicUsize::new(0)),
             placements: Arc::new(RwLock::new(HashMap::new())),
-            control_workers,
+            control_workers: Arc::new(RwLock::new(control_workers)),
+            active_tasks: Arc::new(RwLock::new(HashMap::new())),
+            next_task_id: Arc::new(AtomicU64::new(1)),
+            default_lease_duration: Arc::new(RwLock::new(DEFAULT_CONTROL_TASK_LEASE)),
         })
     }
 
     /// Returns the number of active control worker threads.
     #[must_use]
     pub fn active_thread_count(&self) -> usize {
-        self.control_workers.len()
+        let workers = self
+            .control_workers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        workers.len()
     }
 
     /// Returns the active control physical core bitmask.
@@ -249,52 +309,342 @@ impl ControlPlaneRuntime {
     // Task Dispatching on Dedicated Active Control Threads (ADR-007)
     // ========================================================================
 
-    /// Dispatches a control-plane task to the active control thread pool in round-robin sequence.
-    ///
-    /// The task executes strictly on one of the dedicated active control threads bound to `active_control_mask`.
+    /// Returns the default control task lease duration.
+    #[must_use]
+    pub fn default_lease_duration(&self) -> Duration {
+        *self
+            .default_lease_duration
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sets the default control task lease duration.
+    pub fn set_default_lease_duration(&self, duration: Duration) {
+        *self
+            .default_lease_duration
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = duration;
+    }
+
+    /// Sets the default control task lease duration using builder syntax.
+    #[must_use]
+    pub fn with_default_lease_duration(self, duration: Duration) -> Self {
+        self.set_default_lease_duration(duration);
+        self
+    }
+
+    /// Returns a list of active task lease snapshots.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn active_tasks_snapshot(&self) -> Vec<TaskLeaseSnapshot> {
+        let tasks = self
+            .active_tasks
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        tasks
+            .values()
+            .map(|t| {
+                let elapsed_ms = t.start_time.elapsed().as_millis() as u64;
+                let remaining_ms = if now >= t.deadline {
+                    -(now.duration_since(t.deadline).as_millis() as i64)
+                } else {
+                    t.deadline.duration_since(now).as_millis() as i64
+                };
+                TaskLeaseSnapshot {
+                    task_id: t.task_id,
+                    core_id: t.core_id,
+                    elapsed_ms,
+                    remaining_ms,
+                    is_cancelled: t.cancellation_token.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    /// Signals cooperative cancellation for the specified task ID.
+    pub fn cancel_task(&self, task_id: u64) -> bool {
+        let tasks = self
+            .active_tasks
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(t) = tasks.get(&task_id) {
+            t.cancellation_token.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replaces the active control worker thread for `core_id` with a clean thread bound to that core.
     ///
     /// # Errors
+    /// Returns [`ManagerError`] if thread spawning fails.
+    pub fn replace_worker_thread(&self, core_id: usize) -> Result<(), ManagerError> {
+        let (tx, rx) = channel::<Box<dyn FnOnce(usize) + Send>>();
+        let (ready_tx, ready_rx) = sync_channel::<Result<(), ManagerError>>(1);
+        let backend_clone = Arc::clone(&self.affinity_backend);
+        let thread_name = format!("k3-control-{core_id}-replaced");
+
+        let handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let mask = 1_u64 << core_id;
+                let aff_res = backend_clone.set_affinity(0, mask);
+                let is_ok = aff_res.is_ok();
+                let _ = ready_tx.send(aff_res);
+                if !is_ok {
+                    return;
+                }
+
+                while let Ok(task) = rx.recv() {
+                    task(core_id);
+                }
+            })
+            .map_err(|e| {
+                ManagerError::WorkerSpawn(format!(
+                    "failed to spawn replacement control worker thread for core {core_id}: {e}"
+                ))
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = handle.join();
+                return Err(ManagerError::WorkerSpawn(format!(
+                    "replacement control worker thread for core {core_id} panicked during initialization"
+                )));
+            }
+        }
+
+        let mut workers = self
+            .control_workers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        if let Some(pos) = workers.iter().position(|w| w.core_id == core_id) {
+            workers[pos] = ControlWorkerThread {
+                core_id,
+                sender: tx,
+                handle: Some(handle),
+            };
+        } else {
+            workers.push(ControlWorkerThread {
+                core_id,
+                sender: tx,
+                handle: Some(handle),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Identifies all active control tasks whose lease has expired, sets their cancellation token,
+    /// removes them from the registry, replaces the wedged worker thread for each core,
+    /// and returns the list of preempted `(task_id, core_id)` pairs.
+    pub fn preempt_expired_tasks(&self) -> Vec<(u64, usize)> {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        {
+            let mut tasks = self
+                .active_tasks
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+
+            let expired_ids: Vec<u64> = tasks
+                .iter()
+                .filter(|(_, rec)| now > rec.deadline)
+                .map(|(&id, _)| id)
+                .collect();
+
+            for id in expired_ids {
+                if let Some(rec) = tasks.remove(&id) {
+                    rec.cancellation_token.store(true, Ordering::SeqCst);
+                    expired.push((rec.task_id, rec.core_id));
+                }
+            }
+        }
+
+        for &(_task_id, core_id) in &expired {
+            let _ = self.replace_worker_thread(core_id);
+        }
+
+        expired
+    }
+
+    /// Dispatches a control-plane task with custom lease deadline and cooperative cancellation token.
     ///
-    /// Returns [`ManagerError::WorkerIpc`] if the control worker thread channel is closed.
-    pub fn dispatch_control_task<F, R>(&self, f: F) -> Result<R, ManagerError>
+    /// # Errors
+    /// Returns [`ManagerError::WorkerUnresponsive`] if task lease expires, or [`ManagerError`] on execution failure.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    pub fn dispatch_cancellable_task_with_lease<F, R>(
+        &self,
+        lease_duration: Duration,
+        f: F,
+    ) -> Result<R, ManagerError>
     where
-        F: FnOnce(usize) -> R + Send + 'static,
+        F: FnOnce(Arc<AtomicBool>, usize) -> R + Send + 'static,
         R: Send + 'static,
     {
-        if self.control_workers.is_empty() {
+        let workers = self
+            .control_workers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if workers.is_empty() {
             return Err(ManagerError::WorkerIpc(
                 "no active control worker threads available".to_owned(),
             ));
         }
 
         let assigned_core = self.scheduler.schedule_control_task();
-        let worker = self
-            .control_workers
+        let (core_id, sender) = workers
             .iter()
             .find(|w| w.core_id == assigned_core)
-            .unwrap_or_else(|| {
-                let idx = assigned_core % self.control_workers.len();
-                &self.control_workers[idx]
-            });
+            .map_or_else(
+                || {
+                    let idx = assigned_core % workers.len();
+                    (workers[idx].core_id, workers[idx].sender.clone())
+                },
+                |w| (w.core_id, w.sender.clone()),
+            );
+        drop(workers);
+
+        let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel_token);
+        let start_time = Instant::now();
+        let deadline = start_time + lease_duration;
+
+        {
+            let mut tasks = self
+                .active_tasks
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            tasks.insert(
+                task_id,
+                ActiveTaskRecord {
+                    task_id,
+                    core_id,
+                    start_time,
+                    deadline,
+                    cancellation_token: Arc::clone(&cancel_token),
+                },
+            );
+        }
 
         let (resp_tx, resp_rx) = sync_channel(1);
+        let active_tasks_ref = Arc::clone(&self.active_tasks);
+
         let boxed_task = Box::new(move |core: usize| {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(core)));
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(cancel_clone, core)));
+            {
+                let mut tasks = active_tasks_ref
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                tasks.remove(&task_id);
+            }
             let _ = resp_tx.send(outcome);
         });
 
-        worker
-            .sender
-            .send(boxed_task)
-            .map_err(|_| ManagerError::WorkerIpc("control worker thread is dead".to_owned()))?;
+        if sender.send(boxed_task).is_err() {
+            let mut tasks = self
+                .active_tasks
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            tasks.remove(&task_id);
+            let _ = self.replace_worker_thread(core_id);
+            return Err(ManagerError::WorkerIpc(
+                "control worker thread is dead".to_owned(),
+            ));
+        }
 
-        let outcome = resp_rx.recv().map_err(|_| {
-            ManagerError::WorkerIpc("control worker thread failed to respond".to_owned())
-        })?;
+        let wait_timeout = lease_duration.saturating_add(Duration::from_millis(500));
+        match resp_rx.recv_timeout(wait_timeout) {
+            Ok(outcome) => {
+                if cancel_token.load(Ordering::Relaxed) {
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                    return Err(ManagerError::WorkerUnresponsive {
+                        model_id: "control-plane".to_string(),
+                        pid: None,
+                        elapsed_ms,
+                    });
+                }
+                outcome.map_err(|_| {
+                    ManagerError::WorkerIpc(
+                        "control-plane task panicked during execution".to_owned(),
+                    )
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                cancel_token.store(true, Ordering::SeqCst);
+                let _ = self.replace_worker_thread(core_id);
+                {
+                    let mut tasks = self
+                        .active_tasks
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    tasks.remove(&task_id);
+                }
+                Err(ManagerError::WorkerUnresponsive {
+                    model_id: "control-plane".to_string(),
+                    pid: None,
+                    elapsed_ms,
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                let _ = self.replace_worker_thread(core_id);
+                {
+                    let mut tasks = self
+                        .active_tasks
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    tasks.remove(&task_id);
+                }
+                Err(ManagerError::WorkerUnresponsive {
+                    model_id: "control-plane".to_string(),
+                    pid: None,
+                    elapsed_ms,
+                })
+            }
+        }
+    }
 
-        outcome.map_err(|_| {
-            ManagerError::WorkerIpc("control-plane task panicked during execution".to_owned())
-        })
+    /// Dispatches a control-plane task with custom lease duration.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError::WorkerUnresponsive`] if task lease expires, or [`ManagerError`] on failure.
+    pub fn dispatch_control_task_with_lease<F, R>(
+        &self,
+        lease_duration: Duration,
+        f: F,
+    ) -> Result<R, ManagerError>
+    where
+        F: FnOnce(usize) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.dispatch_cancellable_task_with_lease(lease_duration, move |_cancel, core| f(core))
+    }
+
+    /// Dispatches a control-plane task to the active control thread pool in round-robin sequence.
+    ///
+    /// The task executes strictly on one of the dedicated active control threads bound to `active_control_mask`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagerError`] if the control worker thread channel is closed or task panicked.
+    pub fn dispatch_control_task<F, R>(&self, f: F) -> Result<R, ManagerError>
+    where
+        F: FnOnce(usize) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.dispatch_control_task_with_lease(self.default_lease_duration(), f)
     }
 
     /// Dispatches prompt formatting to execute on a dedicated active control thread (ADR-007).
@@ -852,11 +1202,12 @@ impl ControlPlaneRuntime {
 
 impl Drop for ControlPlaneRuntime {
     fn drop(&mut self) {
-        let mut workers = std::mem::take(&mut self.control_workers);
-        for mut worker in workers.drain(..) {
-            drop(worker.sender);
-            if let Some(handle) = worker.handle.take() {
-                let _ = handle.join();
+        if let Ok(mut workers) = self.control_workers.write() {
+            for mut worker in workers.drain(..) {
+                drop(worker.sender);
+                if let Some(handle) = worker.handle.take() {
+                    let _ = handle.join();
+                }
             }
         }
     }

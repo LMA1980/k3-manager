@@ -82,6 +82,12 @@ pub fn find_worker_binary() -> Result<PathBuf, ManagerError> {
     Ok(PathBuf::from("k3-worker"))
 }
 
+/// Default socket timeout for compute worker heartbeat requests (500ms).
+pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Default socket timeout for compute worker forward pass execution (5s).
+pub const DEFAULT_PASS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Placement and isolation parameters for an isolated model compute worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerPlacement {
@@ -101,6 +107,10 @@ pub struct WorkerPlacement {
     pub affinity: Option<String>,
     /// Explicit executable path override for `k3-worker`.
     pub worker_binary: Option<PathBuf>,
+    /// Heartbeat timeout threshold override.
+    pub heartbeat_timeout: Option<Duration>,
+    /// Forward pass timeout threshold override.
+    pub pass_timeout: Option<Duration>,
 }
 
 impl WorkerPlacement {
@@ -121,6 +131,8 @@ impl WorkerPlacement {
             memlock_limit: None,
             affinity: None,
             worker_binary: None,
+            heartbeat_timeout: None,
+            pass_timeout: None,
         }
     }
 
@@ -151,6 +163,20 @@ impl WorkerPlacement {
         self.worker_binary = Some(binary.into());
         self
     }
+
+    /// Sets explicit heartbeat timeout override.
+    #[must_use]
+    pub const fn with_heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets explicit forward pass timeout override.
+    #[must_use]
+    pub const fn with_pass_timeout(mut self, timeout: Duration) -> Self {
+        self.pass_timeout = Some(timeout);
+        self
+    }
 }
 
 /// Supervised compute worker instance managing an isolated OS process.
@@ -167,6 +193,12 @@ pub struct ManagedWorker {
     generation: u64,
     is_alive: bool,
     last_placement_outcome: Option<PlacementOutcome>,
+    heartbeat_timeout: Duration,
+    pass_timeout: Duration,
+    active_pass_start: Option<Instant>,
+    last_heartbeat_latency: Option<Duration>,
+    last_heartbeat_time: Option<Instant>,
+    has_timed_out: bool,
 }
 
 impl ManagedWorker {
@@ -217,11 +249,114 @@ impl ManagedWorker {
         self.last_placement_outcome.as_ref()
     }
 
+    /// Returns the configured socket heartbeat timeout for this worker.
+    #[must_use]
+    pub const fn heartbeat_timeout(&self) -> Duration {
+        self.heartbeat_timeout
+    }
+
+    /// Sets the socket heartbeat timeout for this worker.
+    pub fn set_heartbeat_timeout(&mut self, timeout: Duration) {
+        self.heartbeat_timeout = timeout;
+    }
+
+    /// Returns the configured forward pass timeout for this worker.
+    #[must_use]
+    pub const fn pass_timeout(&self) -> Duration {
+        self.pass_timeout
+    }
+
+    /// Sets the forward pass timeout for this worker.
+    pub fn set_pass_timeout(&mut self, timeout: Duration) {
+        self.pass_timeout = timeout;
+    }
+
+    /// Returns the start instant of the currently executing forward pass, if any.
+    #[must_use]
+    pub const fn active_pass_start(&self) -> Option<Instant> {
+        self.active_pass_start
+    }
+
+    /// Returns elapsed duration of the currently executing forward pass, if any.
+    #[must_use]
+    pub fn active_pass_elapsed(&self) -> Option<Duration> {
+        self.active_pass_start.map(|t| t.elapsed())
+    }
+
+    /// Returns `true` if a forward pass is currently in flight.
+    #[must_use]
+    pub const fn is_pass_in_flight(&self) -> bool {
+        self.active_pass_start.is_some()
+    }
+
+    /// Returns the measured roundtrip latency of the most recent heartbeat.
+    #[must_use]
+    pub const fn last_heartbeat_latency(&self) -> Option<Duration> {
+        self.last_heartbeat_latency
+    }
+
+    /// Returns the timestamp of the most recent successful heartbeat.
+    #[must_use]
+    pub const fn last_heartbeat_time(&self) -> Option<Instant> {
+        self.last_heartbeat_time
+    }
+
+    /// Returns `true` if this worker has timed out or breached a deadline.
+    #[must_use]
+    pub const fn has_timed_out(&self) -> bool {
+        self.has_timed_out
+    }
+
+    /// Sets the timed out flag on this worker.
+    pub fn set_timed_out(&mut self, timed_out: bool) {
+        self.has_timed_out = timed_out;
+    }
+
+    /// Constructs a simulated [`ManagedWorker`] for testing deadline-bounded IPC and fault recovery.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn create_test_worker(
+        placement: WorkerPlacement,
+        stream: UnixStream,
+        arena: SharedMemoryArena,
+        arena_id: u64,
+        arena_bytes: usize,
+        n_ctx: u32,
+        max_blocks: u32,
+    ) -> Self {
+        let heartbeat_timeout = placement
+            .heartbeat_timeout
+            .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT);
+        let pass_timeout = placement.pass_timeout.unwrap_or(DEFAULT_PASS_TIMEOUT);
+        Self {
+            placement,
+            child: None,
+            stream: Some(stream),
+            arena_id,
+            arena_bytes,
+            n_ctx,
+            max_blocks,
+            arena,
+            generation: 1,
+            is_alive: true,
+            last_placement_outcome: None,
+            heartbeat_timeout,
+            pass_timeout,
+            active_pass_start: None,
+            last_heartbeat_latency: None,
+            last_heartbeat_time: None,
+            has_timed_out: false,
+        }
+    }
+
     /// Checks if the worker process is currently running and healthy.
     pub fn is_alive(&mut self) -> bool {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
-                Ok(None) => self.is_alive,
+                Ok(None) => {
+                    self.is_alive = true;
+                    true
+                }
                 Ok(Some(_status)) => {
                     self.is_alive = false;
                     false
@@ -232,7 +367,7 @@ impl ManagedWorker {
                 }
             }
         } else {
-            false
+            self.is_alive
         }
     }
 
@@ -241,6 +376,18 @@ impl ManagedWorker {
     /// # Errors
     /// Returns [`ManagerError::WorkerIpc`] if sending signal fails.
     pub fn kill(&mut self, signal: libc::c_int) -> Result<(), ManagerError> {
+        let is_non_terminating = matches!(
+            signal,
+            libc::SIGSTOP
+                | libc::SIGCONT
+                | libc::SIGTSTP
+                | libc::SIGTTIN
+                | libc::SIGTTOU
+                | libc::SIGCHLD
+                | libc::SIGWINCH
+                | libc::SIGURG
+        );
+
         if let Some(child) = &mut self.child {
             let pid = child.id();
             // SAFETY: kill sends standard signal to supervised child pid.
@@ -251,23 +398,36 @@ impl ManagedWorker {
                     "failed to send signal {signal} to pid {pid}: {err}"
                 )));
             }
-            self.is_alive = false;
-            // Close stream immediately to mirror socket termination
-            self.stream = None;
+
+            if is_non_terminating {
+                // Non-terminating signal: process remains alive in OS; stream remains open
+                return Ok(());
+            }
 
             // Wait briefly for kernel to deliver signal and record exit status
             let start = Instant::now();
-            while start.elapsed() < Duration::from_millis(200) {
+            while start.elapsed() < Duration::from_millis(50) {
                 if let Ok(Some(_)) = child.try_wait() {
-                    break;
+                    self.is_alive = false;
+                    self.stream = None;
+                    return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
+
+            if let Ok(Some(_)) = child.try_wait() {
+                self.is_alive = false;
+                self.stream = None;
+            }
+
             Ok(())
         } else {
-            Err(ManagerError::WorkerIpc(
-                "worker child process is not running".to_owned(),
-            ))
+            if is_non_terminating {
+                return Ok(());
+            }
+            self.is_alive = false;
+            self.stream = None;
+            Ok(())
         }
     }
 
@@ -306,25 +466,68 @@ impl ManagedWorker {
         }
     }
 
-    /// Sends a heartbeat request to the worker over UDS.
+    /// Sends a heartbeat request to the worker over UDS with deadline-bounded timeout.
     ///
     /// # Errors
-    /// Returns [`ManagerError`] on communication failure.
+    /// Returns [`ManagerError::WorkerUnresponsive`] if heartbeat times out, or [`ManagerError`] on communication failure.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn send_heartbeat(&mut self) -> Result<WorkerHeartbeatResponse, ManagerError> {
         let stream = self
             .stream
             .as_ref()
             .ok_or_else(|| ManagerError::WorkerIpc("worker stream is closed".to_owned()))?;
 
+        let _ = stream.set_read_timeout(Some(self.heartbeat_timeout));
+        let _ = stream.set_write_timeout(Some(self.heartbeat_timeout));
+
+        let t0 = Instant::now();
         let req = IpcMessage::WorkerHeartbeatRequest(WorkerHeartbeatRequest { timestamp_ns: 1 });
 
-        send_msg_frame(stream, &req, None).map_err(|e| {
-            ManagerError::WorkerIpc(format!("failed to send WorkerHeartbeatRequest: {e}"))
-        })?;
+        if let Err(e) = send_msg_frame(stream, &req, None) {
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            let is_timeout = e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut
+                || e.raw_os_error() == Some(libc::EAGAIN)
+                || e.raw_os_error() == Some(libc::ETIMEDOUT);
+            if is_timeout {
+                self.has_timed_out = true;
+                return Err(ManagerError::WorkerUnresponsive {
+                    model_id: self.placement.model_id.clone(),
+                    pid: self.pid(),
+                    elapsed_ms,
+                });
+            }
+            return Err(ManagerError::WorkerIpc(format!(
+                "failed to send WorkerHeartbeatRequest: {e}"
+            )));
+        }
 
-        let (reply, _) = recv_msg_frame(stream).map_err(|e| {
-            ManagerError::WorkerIpc(format!("failed to receive WorkerHeartbeatResponse: {e}"))
-        })?;
+        let (reply, _) = match recv_msg_frame(stream) {
+            Ok(r) => r,
+            Err(e) => {
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let is_timeout = e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.raw_os_error() == Some(libc::EAGAIN)
+                    || e.raw_os_error() == Some(libc::ETIMEDOUT);
+                if is_timeout {
+                    self.has_timed_out = true;
+                    return Err(ManagerError::WorkerUnresponsive {
+                        model_id: self.placement.model_id.clone(),
+                        pid: self.pid(),
+                        elapsed_ms,
+                    });
+                }
+                return Err(ManagerError::WorkerIpc(format!(
+                    "failed to receive WorkerHeartbeatResponse: {e}"
+                )));
+            }
+        };
+
+        let latency = t0.elapsed();
+        self.last_heartbeat_latency = Some(latency);
+        self.last_heartbeat_time = Some(Instant::now());
+        self.has_timed_out = false;
 
         match reply {
             IpcMessage::WorkerHeartbeatResponse(resp) => Ok(resp),
@@ -372,10 +575,11 @@ impl ManagedWorker {
         Ok(())
     }
 
-    /// Dispatches a zero-copy forward pass to this worker.
+    /// Dispatches a zero-copy forward pass to this worker with deadline-bounded timeout.
     ///
     /// # Errors
-    /// Returns [`ManagerError`] on failure.
+    /// Returns [`ManagerError::WorkerUnresponsive`] if pass times out, or [`ManagerError`] on failure.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn execute_forward_pass(
         &mut self,
         req: &ForwardPassRequest,
@@ -399,24 +603,77 @@ impl ManagedWorker {
             .as_ref()
             .ok_or_else(|| ManagerError::WorkerIpc("worker UDS connection is dead".to_owned()))?;
 
+        let _ = stream.set_read_timeout(Some(self.pass_timeout));
+        let _ = stream.set_write_timeout(Some(self.pass_timeout));
+
+        let t0 = Instant::now();
+        self.active_pass_start = Some(t0);
+
         let res = dispatch_forward_pass(stream, &mut self.arena, req);
-        if res.is_err() {
-            // Check if process crashed mid-pass
-            if !self.is_alive() {
-                let status = self
-                    .child
-                    .as_mut()
-                    .and_then(|c| c.try_wait().ok().flatten());
-                let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
-                let signal = status.as_ref().and_then(ExitStatusExt::signal);
-                return Err(ManagerError::WorkerCrashed {
-                    model_id: self.placement.model_id.clone(),
-                    exit_code,
-                    signal,
-                });
+        self.active_pass_start = None;
+
+        match res {
+            Ok(val) => {
+                self.has_timed_out = false;
+                Ok(val)
+            }
+            Err(e) => {
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let is_timeout = match &e {
+                    ManagerError::Io(io_err) => {
+                        io_err.kind() == std::io::ErrorKind::WouldBlock
+                            || io_err.kind() == std::io::ErrorKind::TimedOut
+                            || io_err.raw_os_error() == Some(libc::EAGAIN)
+                            || io_err.raw_os_error() == Some(libc::ETIMEDOUT)
+                    }
+                    ManagerError::WorkerIpc(msg) => {
+                        msg.contains("timed out")
+                            || msg.contains("Resource temporarily unavailable")
+                            || msg.contains("Operation timed out")
+                    }
+                    _ => false,
+                };
+
+                if is_timeout {
+                    self.has_timed_out = true;
+                    return Err(ManagerError::WorkerUnresponsive {
+                        model_id: self.placement.model_id.clone(),
+                        pid: self.pid(),
+                        elapsed_ms,
+                    });
+                }
+
+                // Check if process crashed mid-pass
+                if !self.is_alive() {
+                    let status = self
+                        .child
+                        .as_mut()
+                        .and_then(|c| c.try_wait().ok().flatten());
+                    let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
+                    let signal = status.as_ref().and_then(ExitStatusExt::signal);
+                    return Err(ManagerError::WorkerCrashed {
+                        model_id: self.placement.model_id.clone(),
+                        exit_code,
+                        signal,
+                    });
+                }
+
+                Err(e)
             }
         }
-        res
+    }
+
+    /// Dispatches a zero-copy forward pass to this worker with deadline-bounded timeout.
+    ///
+    /// Alias for [`execute_forward_pass`](Self::execute_forward_pass) fulfilling US-06.3 (#75) requirements.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError::WorkerUnresponsive`] if pass times out, or [`ManagerError`] on failure.
+    pub fn dispatch_forward_pass(
+        &mut self,
+        req: &ForwardPassRequest,
+    ) -> Result<ForwardPassResult, ManagerError> {
+        self.execute_forward_pass(req)
     }
 
     // ========================================================================
@@ -699,6 +956,8 @@ pub struct WorkerSupervisor {
     workers: HashMap<String, ManagedWorker>,
     domain_controller: Arc<dyn IsolationDomainController>,
     capacity: ResolvedControlCapacity,
+    default_heartbeat_timeout: Duration,
+    default_pass_timeout: Duration,
 }
 
 impl Default for WorkerSupervisor {
@@ -720,6 +979,8 @@ impl WorkerSupervisor {
             workers: HashMap::new(),
             domain_controller: Arc::new(CgroupV2DomainController::default()),
             capacity,
+            default_heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
+            default_pass_timeout: DEFAULT_PASS_TIMEOUT,
         }
     }
 
@@ -756,6 +1017,42 @@ impl WorkerSupervisor {
         &self.capacity
     }
 
+    /// Returns the default heartbeat timeout.
+    #[must_use]
+    pub const fn default_heartbeat_timeout(&self) -> Duration {
+        self.default_heartbeat_timeout
+    }
+
+    /// Sets the default heartbeat timeout.
+    pub fn set_default_heartbeat_timeout(&mut self, timeout: Duration) {
+        self.default_heartbeat_timeout = timeout;
+    }
+
+    /// Sets the default heartbeat timeout using builder syntax.
+    #[must_use]
+    pub const fn with_default_heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.default_heartbeat_timeout = timeout;
+        self
+    }
+
+    /// Returns the default forward pass timeout.
+    #[must_use]
+    pub const fn default_pass_timeout(&self) -> Duration {
+        self.default_pass_timeout
+    }
+
+    /// Sets the default forward pass timeout.
+    pub fn set_default_pass_timeout(&mut self, timeout: Duration) {
+        self.default_pass_timeout = timeout;
+    }
+
+    /// Sets the default forward pass timeout using builder syntax.
+    #[must_use]
+    pub const fn with_default_pass_timeout(mut self, timeout: Duration) -> Self {
+        self.default_pass_timeout = timeout;
+        self
+    }
+
     /// Returns a reference to the active [`IsolationDomainController`].
     #[must_use]
     pub fn domain_controller(&self) -> &Arc<dyn IsolationDomainController> {
@@ -783,6 +1080,14 @@ impl WorkerSupervisor {
         self.workers.len()
     }
 
+    /// Returns a sorted list of registered model identifiers.
+    #[must_use]
+    pub fn model_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.workers.keys().cloned().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Returns `true` if a worker for `model_id` is registered.
     #[must_use]
     pub fn contains_model(&self, model_id: &str) -> bool {
@@ -798,6 +1103,11 @@ impl WorkerSupervisor {
     /// Returns a mutable reference to the [`ManagedWorker`] for `model_id`.
     pub fn get_worker_mut(&mut self, model_id: &str) -> Option<&mut ManagedWorker> {
         self.workers.get_mut(model_id)
+    }
+
+    /// Registers a pre-constructed [`ManagedWorker`] into the supervisor.
+    pub fn register_worker(&mut self, worker: ManagedWorker) {
+        self.workers.insert(worker.model_id().to_owned(), worker);
     }
 
     /// Spawns a new isolated compute worker for the specified model placement,
@@ -845,6 +1155,11 @@ impl WorkerSupervisor {
             };
 
         let model_id = placement.model_id.clone();
+        let heartbeat_timeout = placement
+            .heartbeat_timeout
+            .unwrap_or(self.default_heartbeat_timeout);
+        let pass_timeout = placement.pass_timeout.unwrap_or(self.default_pass_timeout);
+
         let worker = ManagedWorker {
             placement,
             child: Some(child),
@@ -857,6 +1172,12 @@ impl WorkerSupervisor {
             generation: 1,
             is_alive: true,
             last_placement_outcome: Some(placement_outcome),
+            heartbeat_timeout,
+            pass_timeout,
+            active_pass_start: None,
+            last_heartbeat_latency: None,
+            last_heartbeat_time: None,
+            has_timed_out: false,
         };
 
         self.workers.insert(model_id.clone(), worker);
@@ -959,6 +1280,8 @@ impl WorkerSupervisor {
         worker.generation += 1;
         worker.is_alive = true;
         worker.last_placement_outcome = Some(placement_outcome);
+        worker.active_pass_start = None;
+        worker.has_timed_out = false;
 
         Ok(self.workers.get_mut(model_id).expect("worker exists"))
     }

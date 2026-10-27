@@ -25,6 +25,15 @@ pub enum ManagerError {
         /// Terminating signal if killed.
         signal: Option<i32>,
     },
+    /// Compute worker or control task timed out or failed to respond within deadline bounds.
+    WorkerUnresponsive {
+        /// Logical model identifier or task name.
+        model_id: String,
+        /// OS process ID if known.
+        pid: Option<u32>,
+        /// Elapsed time in milliseconds when timeout occurred.
+        elapsed_ms: u64,
+    },
     /// Shared memory arena or `SCM_RIGHTS` transfer error.
     Shm(IpcError),
     /// Core affinity configuration, topology validation, or reservation error.
@@ -60,6 +69,16 @@ impl fmt::Display for ManagerError {
                 write!(
                     f,
                     "[k3-manager worker crash] model '{model_id}' terminated abnormally (exit_code: {exit_code:?}, signal: {signal:?})"
+                )
+            }
+            Self::WorkerUnresponsive {
+                model_id,
+                pid,
+                elapsed_ms,
+            } => {
+                write!(
+                    f,
+                    "[k3-manager worker unresponsive] model '{model_id}' (pid: {pid:?}) timed out after {elapsed_ms}ms"
                 )
             }
             Self::Shm(e) => write!(f, "[k3-manager shm error] {e}"),
@@ -171,5 +190,19 @@ mod tests {
 
         let proto_err = ManagerError::Protocol("invalid frame".to_string());
         assert!(proto_err.source().is_none());
+    }
+
+    #[test]
+    fn test_worker_unresponsive_error_display() {
+        let err = ManagerError::WorkerUnresponsive {
+            model_id: "qwen2.5-7b".to_string(),
+            pid: Some(1234),
+            elapsed_ms: 250,
+        };
+        let disp = format!("{err}");
+        assert!(disp.contains("[k3-manager worker unresponsive]"));
+        assert!(disp.contains("qwen2.5-7b"));
+        assert!(disp.contains("1234"));
+        assert!(disp.contains("250ms"));
     }
 }
