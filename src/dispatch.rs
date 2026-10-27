@@ -177,14 +177,22 @@ pub fn dispatch_forward_pass(
     });
 
     send_msg_frame(stream, &cmd, None).map_err(|e| {
-        ManagerError::WorkerIpc(format!("failed to send ForwardPassCommand to worker: {e}"))
+        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+            ManagerError::Io(e)
+        } else {
+            ManagerError::WorkerIpc(format!("failed to send ForwardPassCommand to worker: {e}"))
+        }
     })?;
 
     // 6. Receive ForwardPassCompleted from worker
     let (reply, _) = recv_msg_frame(stream).map_err(|e| {
-        ManagerError::WorkerIpc(format!(
-            "failed to receive ForwardPassCompleted from worker: {e}"
-        ))
+        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+            ManagerError::Io(e)
+        } else {
+            ManagerError::WorkerIpc(format!(
+                "failed to receive ForwardPassCompleted from worker: {e}"
+            ))
+        }
     })?;
 
     let completed = match reply {

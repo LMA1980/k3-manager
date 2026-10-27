@@ -9,6 +9,7 @@ pub mod client;
 pub mod dispatch;
 pub mod domain;
 pub mod error;
+pub mod health;
 pub mod prefix;
 pub mod prompt;
 pub mod runtime;
@@ -34,6 +35,9 @@ pub use domain::{
     validate_model_id,
 };
 pub use error::ManagerError;
+pub use health::{
+    HealthSupervisor, HealthSupervisorConfig, RecoveryAction, RecoveryAuditEvent, RecoveryTarget,
+};
 pub use prefix::{
     BLOCK_SIZE_TOKENS, BlockTokens, PrefixCacheStats, PrefixMatchResult, PrefixRadixIndex,
 };
@@ -43,5 +47,11 @@ pub use prompt::{
     StreamingDetokenizer, TokenType, Tokenizer, evaluate_stop_token, format_chat_prompt,
     validate_and_tokenize,
 };
-pub use runtime::{AdminCommand, AdminResponse, ControlPlaneRuntime, WorkerHealthSnapshot};
-pub use supervisor::{ManagedWorker, WorkerPlacement, WorkerSupervisor, find_worker_binary};
+pub use runtime::{
+    ActiveTaskRecord, AdminCommand, AdminResponse, ControlPlaneRuntime, DEFAULT_CONTROL_TASK_LEASE,
+    TaskLeaseSnapshot, WorkerHealthSnapshot,
+};
+pub use supervisor::{
+    DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_PASS_TIMEOUT, ManagedWorker, WorkerPlacement,
+    WorkerSupervisor, find_worker_binary,
+};
