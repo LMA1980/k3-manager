@@ -23,7 +23,29 @@ use crate::prompt::{
     ChatTemplate, GgufTokenizer, IncrementalStopDetector, PreparedPrompt, PromptOrchestrator,
     PromptPreparationRequest, SpecialTokens, Tokenizer,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use k3_core::affinity::ResolvedControlCapacity;
+pub use k3_core::profile::{
+    CONSERVATIVE_DEFAULT_A100_CORES, CONSERVATIVE_DEFAULT_N_CTX, CONSERVATIVE_DEFAULT_X100_CORES,
+    CONSERVATIVE_TUNING_ADVISORY, CONSTRAINED_TEST_N_CTX, ComputePool, ModelEntry,
+    ModelListResponse, ModelLoadAuditEvent, ModelProfile, PriorityClass, ProfileStatus,
+    TuningProfile,
+};
+use serde::{Deserialize, Serialize};
+
+fn current_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn current_timestamp_ms() -> u64 {
+    #[allow(clippy::cast_possible_truncation)]
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
 
 /// Health and status snapshot of a managed compute worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,13 +62,188 @@ pub struct WorkerHealthSnapshot {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelPlacementRecord {
-    model_id: String,
-    cluster: String,
-    pid: Option<u32>,
-    is_alive: bool,
-    generation: u64,
+/// Placement, status, and tuning metadata for a model managed in the control plane.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPlacementRecord {
+    /// Logical model identifier.
+    pub model_id: String,
+    /// Path to model weights file, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weights_path: Option<PathBuf>,
+    /// Compute cluster target (`"x100"`, `"a100"`, `"both"`).
+    pub cluster: String,
+    /// Operating system process ID if running.
+    pub pid: Option<u32>,
+    /// Whether worker is actively alive.
+    pub is_alive: bool,
+    /// Generation counter (incremented on recoveries).
+    pub generation: u64,
+    /// Authoritative tuning profile.
+    pub tuning: TuningProfile,
+    /// Explicit boolean flag tagging unprofiled models.
+    pub unprofiled: bool,
+    /// Profile status string ("unprofiled" or "profiled").
+    pub profile_status: String,
+    /// Active scheduling priority class ("throughput" or "latency").
+    pub priority_class: String,
+    /// Context window limit in tokens.
+    pub n_ctx: usize,
+    /// Whether dynamic idle core lending is enabled.
+    pub lend_idle_cores: bool,
+    /// Whether dynamic idle core borrowing is enabled.
+    pub borrow_idle_cores: bool,
+    /// Actionable advisory notice when unprofiled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advisory_notice: Option<String>,
+    /// Unix creation timestamp in seconds.
+    pub created: u64,
+}
+
+impl ModelPlacementRecord {
+    /// Creates a new model placement record with conservative unprofiled defaults (ADR-028, ADR-031).
+    pub fn new_unprofiled(
+        model_id: impl Into<String>,
+        weights_path: Option<PathBuf>,
+        cluster: impl Into<String>,
+        pid: Option<u32>,
+    ) -> Self {
+        let model_id_str = model_id.into();
+        let mut tuning = TuningProfile::conservative_default();
+        tuning.model_id = Some(model_id_str.clone());
+        let unprofiled = tuning.unprofiled;
+        let profile_status = tuning.profile_status.as_str().to_owned();
+        let priority_class = tuning.priority_class.as_str().to_owned();
+        let n_ctx = tuning.n_ctx;
+        let lend_idle_cores = tuning.lend_idle_cores;
+        let borrow_idle_cores = tuning.borrow_idle_cores;
+        let advisory_notice = tuning.advisory_notice.clone();
+        let created = current_timestamp_secs();
+
+        Self {
+            model_id: model_id_str,
+            weights_path,
+            cluster: cluster.into(),
+            pid,
+            is_alive: true,
+            generation: 1,
+            tuning,
+            unprofiled,
+            profile_status,
+            priority_class,
+            n_ctx,
+            lend_idle_cores,
+            borrow_idle_cores,
+            advisory_notice,
+            created,
+        }
+    }
+
+    /// Creates a new model placement record with an explicit tuning profile.
+    pub fn with_tuning(
+        model_id: impl Into<String>,
+        weights_path: Option<PathBuf>,
+        pid: Option<u32>,
+        mut tuning: TuningProfile,
+    ) -> Self {
+        let model_id_str = model_id.into();
+        tuning.model_id = Some(model_id_str.clone());
+        let cluster = tuning.cluster.clone();
+        let unprofiled = tuning.unprofiled;
+        let profile_status = tuning.profile_status.as_str().to_owned();
+        let priority_class = tuning.priority_class.as_str().to_owned();
+        let n_ctx = tuning.n_ctx;
+        let lend_idle_cores = tuning.lend_idle_cores;
+        let borrow_idle_cores = tuning.borrow_idle_cores;
+        let advisory_notice = tuning.advisory_notice.clone();
+        let created = current_timestamp_secs();
+
+        Self {
+            model_id: model_id_str,
+            weights_path,
+            cluster,
+            pid,
+            is_alive: true,
+            generation: 1,
+            tuning,
+            unprofiled,
+            profile_status,
+            priority_class,
+            n_ctx,
+            lend_idle_cores,
+            borrow_idle_cores,
+            advisory_notice,
+            created,
+        }
+    }
+
+    /// Converts this placement record to an `OpenAI` `/v1/models`-compatible [`ModelEntry`].
+    #[must_use]
+    pub fn to_model_entry(&self) -> ModelEntry {
+        ModelEntry {
+            id: self.model_id.clone(),
+            object: "model".to_owned(),
+            created: self.created,
+            owned_by: "k3".to_owned(),
+            unprofiled: self.unprofiled,
+            profile_status: self.profile_status.clone(),
+            priority_class: self.priority_class.clone(),
+            cluster: self.cluster.clone(),
+            a100_cores: self.tuning.a100_cores,
+            n_ctx: self.n_ctx,
+            lend_idle_cores: self.lend_idle_cores,
+            borrow_idle_cores: self.borrow_idle_cores,
+            advisory_notice: self.advisory_notice.clone(),
+        }
+    }
+}
+
+/// Category of operational audit event for model lifecycle actions (US-07 R2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAuditEventType {
+    /// Model registered into control plane registry.
+    ModelRegistered,
+    /// Model loaded and placement recorded.
+    ModelLoaded,
+    /// Model status queried via control plane or /v1/models.
+    ModelStatusQueried,
+    /// Operator applied a tuning profile, transitioning from unprofiled defaults.
+    TuningProfileApplied,
+}
+
+/// Structured operational audit event for model registration, load, query, and tuning transitions (US-07 R2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAuditEvent {
+    /// Event timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
+    /// Type of lifecycle audit event.
+    pub event_type: ModelAuditEventType,
+    /// Logical model identifier.
+    pub model_id: String,
+    /// Whether the model is unprofiled at the time of the event.
+    pub unprofiled: bool,
+    /// Profile status string ("unprofiled" or "profiled").
+    pub profile_status: String,
+    /// Target processor cluster ("x100", "a100", "both").
+    pub cluster: String,
+    /// Scheduling priority class ("throughput" or "latency").
+    pub priority_class: String,
+    /// Context window bound in tokens.
+    pub n_ctx: usize,
+    /// Actionable advisory notice when unprofiled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advisory_notice: Option<String>,
+    /// Human-readable event description and context.
+    pub details: String,
+}
+
+impl ModelAuditEvent {
+    /// Returns the advisory notice, if any.
+    #[must_use]
+    pub fn advisory(&self) -> Option<&str> {
+        self.advisory_notice.as_deref()
+    }
 }
 
 /// Administrative command submitted to the control-plane runtime plane.
@@ -85,6 +282,22 @@ pub enum AdminCommand {
         /// Model identifier.
         model_id: String,
     },
+    /// Query detailed model status and profile entry.
+    GetModelStatus {
+        /// Model identifier.
+        model_id: String,
+    },
+    /// Query all registered models as `/v1/models` listing entries.
+    ListModels,
+    /// Apply an operator tuning profile to transition an unprofiled model (ADR-031, ADR-032).
+    ApplyTuningProfile {
+        /// Model identifier.
+        model_id: String,
+        /// Operator tuning profile configuration.
+        profile: TuningProfile,
+    },
+    /// Query operational model audit event history.
+    GetAuditEvents,
 }
 
 /// Administrative response returned by the control-plane runtime.
@@ -108,6 +321,14 @@ pub enum AdminResponse {
     ModelRegistered(String),
     /// Confirmation of model unregistration.
     ModelUnregistered(String),
+    /// Model status and listing entry.
+    ModelStatus(ModelEntry),
+    /// List of model listing entries.
+    ModelList(Vec<ModelEntry>),
+    /// Confirmation that operator tuning profile was applied.
+    TuningProfileApplied(String),
+    /// Model operational audit event history.
+    AuditEvents(Vec<ModelAuditEvent>),
 }
 
 /// Default control task lease duration (5 seconds).
@@ -170,6 +391,7 @@ pub struct ControlPlaneRuntime {
     active_tasks: Arc<RwLock<HashMap<u64, ActiveTaskRecord>>>,
     next_task_id: Arc<AtomicU64>,
     default_lease_duration: Arc<RwLock<Duration>>,
+    audit_events: Arc<RwLock<Vec<ModelAuditEvent>>>,
 }
 
 impl ControlPlaneRuntime {
@@ -268,6 +490,7 @@ impl ControlPlaneRuntime {
             active_tasks: Arc::new(RwLock::new(HashMap::new())),
             next_task_id: Arc::new(AtomicU64::new(1)),
             default_lease_duration: Arc::new(RwLock::new(DEFAULT_CONTROL_TASK_LEASE)),
+            audit_events: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -799,8 +1022,9 @@ impl ControlPlaneRuntime {
         let p_idx = Arc::clone(&self.prefix_index);
         let q_depth = Arc::clone(&self.queue_depth);
         let pl_map = Arc::clone(&self.placements);
+        let audits = Arc::clone(&self.audit_events);
         self.dispatch_control_task(move |_| {
-            Self::execute_admin_core(&cap, &p_idx, &q_depth, &pl_map, cmd)
+            Self::execute_admin_core(&cap, &p_idx, &q_depth, &pl_map, &audits, cmd)
         })?
     }
 
@@ -1040,22 +1264,50 @@ impl ControlPlaneRuntime {
         }
     }
 
-    /// Records or updates a model placement in the status plane.
+    /// Records or updates a model placement in the status plane with conservative unprofiled defaults.
     pub fn record_model_placement(&self, model_id: String, cluster: String, pid: Option<u32>) {
+        self.record_model_placement_with_tuning(model_id, cluster, pid, None);
+    }
+
+    /// Records or updates a model placement with an optional operator tuning profile.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn record_model_placement_with_tuning(
+        &self,
+        model_id: String,
+        cluster: String,
+        pid: Option<u32>,
+        tuning: Option<TuningProfile>,
+    ) {
+        let record = match tuning {
+            Some(t) => ModelPlacementRecord::with_tuning(model_id.clone(), None, pid, t),
+            None => ModelPlacementRecord::new_unprofiled(model_id.clone(), None, cluster, pid),
+        };
+        let entry = record.to_model_entry();
         let mut map = self
             .placements
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        map.insert(
-            model_id.clone(),
-            ModelPlacementRecord {
-                model_id,
-                cluster,
-                pid,
-                is_alive: true,
-                generation: 1,
-            },
-        );
+        map.insert(model_id.clone(), record);
+
+        let event = ModelAuditEvent {
+            timestamp_ms: current_timestamp_ms(),
+            event_type: ModelAuditEventType::ModelLoaded,
+            model_id: model_id.clone(),
+            unprofiled: entry.unprofiled,
+            profile_status: entry.profile_status.clone(),
+            cluster: entry.cluster.clone(),
+            priority_class: entry.priority_class.clone(),
+            n_ctx: entry.n_ctx,
+            advisory_notice: entry.advisory_notice.clone(),
+            details: format!(
+                "loaded model '{model_id}' (unprofiled: {})",
+                entry.unprofiled
+            ),
+        };
+        self.audit_events
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event);
     }
 
     /// Removes a model placement from the status plane.
@@ -1128,15 +1380,106 @@ impl ControlPlaneRuntime {
             .collect()
     }
 
+    /// Generates an `OpenAI` `/v1/models`-compatible collection response listing all active models (ADR-031).
+    #[must_use]
+    pub fn v1_models_response(&self) -> ModelListResponse {
+        let map = self
+            .placements
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut data: Vec<ModelEntry> = map
+            .values()
+            .map(ModelPlacementRecord::to_model_entry)
+            .collect();
+        data.sort_by(|a, b| a.id.cmp(&b.id));
+        ModelListResponse::new(data)
+    }
+
+    /// Serializes the `/v1/models` collection response to pretty-printed JSON.
+    ///
+    /// # Errors
+    /// Returns [`serde_json::Error`] if serialization fails.
+    pub fn v1_models_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.v1_models_response())
+    }
+
+    /// Retrieves the [`ModelEntry`] for `model_id` and emits a [`ModelAuditEventType::ModelStatusQueried`] event.
+    pub fn get_model_entry(&self, model_id: &str) -> Option<ModelEntry> {
+        let map = self
+            .placements
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let record = map.get(model_id)?;
+        let entry = record.to_model_entry();
+        drop(map);
+
+        let event = ModelAuditEvent {
+            timestamp_ms: current_timestamp_ms(),
+            event_type: ModelAuditEventType::ModelStatusQueried,
+            model_id: model_id.to_owned(),
+            unprofiled: entry.unprofiled,
+            profile_status: entry.profile_status.clone(),
+            cluster: entry.cluster.clone(),
+            priority_class: entry.priority_class.clone(),
+            n_ctx: entry.n_ctx,
+            advisory_notice: entry.advisory_notice.clone(),
+            details: format!(
+                "queried model entry for '{model_id}' (unprofiled: {})",
+                entry.unprofiled
+            ),
+        };
+        self.audit_events
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event);
+
+        Some(entry)
+    }
+
+    /// Transitions an existing model placement by applying an operator tuning profile (ADR-031, ADR-032).
+    ///
+    /// # Errors
+    /// Returns [`ManagerError::ModelNotFound`] if `model_id` is not registered.
+    pub fn apply_tuning_profile(
+        &self,
+        model_id: &str,
+        profile: TuningProfile,
+    ) -> Result<(), ManagerError> {
+        let _ = self.execute_admin(AdminCommand::ApplyTuningProfile {
+            model_id: model_id.to_owned(),
+            profile,
+        })?;
+        Ok(())
+    }
+
+    /// Returns a snapshot of all recorded operational model audit events.
+    #[must_use]
+    pub fn audit_events(&self) -> Vec<ModelAuditEvent> {
+        self.audit_events
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Clears recorded model audit events (useful for test isolation).
+    pub fn clear_audit_events(&self) {
+        self.audit_events
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
     // ========================================================================
     // Administrative Command Dispatch
     // ========================================================================
 
+    #[allow(clippy::too_many_lines)]
     fn execute_admin_core(
         capacity: &ResolvedControlCapacity,
         prefix_index: &Arc<PrefixRadixIndex>,
         queue_depth: &Arc<AtomicUsize>,
         placements: &Arc<RwLock<HashMap<String, ModelPlacementRecord>>>,
+        audit_events: &Arc<RwLock<Vec<ModelAuditEvent>>>,
         cmd: AdminCommand,
     ) -> Result<AdminResponse, ManagerError> {
         match cmd {
@@ -1186,7 +1529,7 @@ impl ControlPlaneRuntime {
             }
             AdminCommand::RegisterModel {
                 model_id,
-                weights_path: _,
+                weights_path,
                 cluster,
             } => {
                 crate::domain::validate_model_id(&model_id)?;
@@ -1197,16 +1540,35 @@ impl ControlPlaneRuntime {
                     )));
                 }
                 let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
-                map.insert(
+                let record = ModelPlacementRecord::new_unprofiled(
                     model_id.clone(),
-                    ModelPlacementRecord {
-                        model_id: model_id.clone(),
-                        cluster: norm_cluster,
-                        pid: None,
-                        is_alive: true,
-                        generation: 1,
-                    },
+                    Some(weights_path),
+                    norm_cluster,
+                    None,
                 );
+                let entry = record.to_model_entry();
+                map.insert(model_id.clone(), record);
+
+                let event = ModelAuditEvent {
+                    timestamp_ms: current_timestamp_ms(),
+                    event_type: ModelAuditEventType::ModelRegistered,
+                    model_id: model_id.clone(),
+                    unprofiled: entry.unprofiled,
+                    profile_status: entry.profile_status.clone(),
+                    cluster: entry.cluster.clone(),
+                    priority_class: entry.priority_class.clone(),
+                    n_ctx: entry.n_ctx,
+                    advisory_notice: entry.advisory_notice.clone(),
+                    details: format!(
+                        "registered model '{model_id}' under conservative defaults (unprofiled: {})",
+                        entry.unprofiled
+                    ),
+                };
+                audit_events
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(event);
+
                 Ok(AdminResponse::ModelRegistered(model_id))
             }
             AdminCommand::UnregisterModel { model_id } => {
@@ -1214,6 +1576,101 @@ impl ControlPlaneRuntime {
                 let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
                 map.remove(&model_id);
                 Ok(AdminResponse::ModelUnregistered(model_id))
+            }
+            AdminCommand::GetModelStatus { model_id } => {
+                crate::domain::validate_model_id(&model_id)?;
+                let map = placements.read().unwrap_or_else(PoisonError::into_inner);
+                let record = map
+                    .get(&model_id)
+                    .ok_or_else(|| ManagerError::ModelNotFound(model_id.clone()))?;
+                let entry = record.to_model_entry();
+                drop(map);
+
+                let event = ModelAuditEvent {
+                    timestamp_ms: current_timestamp_ms(),
+                    event_type: ModelAuditEventType::ModelStatusQueried,
+                    model_id: model_id.clone(),
+                    unprofiled: entry.unprofiled,
+                    profile_status: entry.profile_status.clone(),
+                    cluster: entry.cluster.clone(),
+                    priority_class: entry.priority_class.clone(),
+                    n_ctx: entry.n_ctx,
+                    advisory_notice: entry.advisory_notice.clone(),
+                    details: format!(
+                        "queried status for model '{model_id}' (unprofiled: {})",
+                        entry.unprofiled
+                    ),
+                };
+                audit_events
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(event);
+
+                Ok(AdminResponse::ModelStatus(entry))
+            }
+            AdminCommand::ListModels => {
+                let map = placements.read().unwrap_or_else(PoisonError::into_inner);
+                let mut entries: Vec<ModelEntry> = map
+                    .values()
+                    .map(ModelPlacementRecord::to_model_entry)
+                    .collect();
+                entries.sort_by(|a, b| a.id.cmp(&b.id));
+                Ok(AdminResponse::ModelList(entries))
+            }
+            AdminCommand::ApplyTuningProfile { model_id, profile } => {
+                crate::domain::validate_model_id(&model_id)?;
+                let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
+                let record = map
+                    .get_mut(&model_id)
+                    .ok_or_else(|| ManagerError::ModelNotFound(model_id.clone()))?;
+
+                let mut tuned = profile;
+                tuned.model_id = Some(model_id.clone());
+                tuned.profile_status = ProfileStatus::Profiled;
+                tuned.unprofiled = false;
+                tuned.advisory_notice = None;
+
+                record.cluster.clone_from(&tuned.cluster);
+                record.unprofiled = false;
+                "profiled".clone_into(&mut record.profile_status);
+                tuned
+                    .priority_class
+                    .as_str()
+                    .clone_into(&mut record.priority_class);
+                record.n_ctx = tuned.n_ctx;
+                record.lend_idle_cores = tuned.lend_idle_cores;
+                record.borrow_idle_cores = tuned.borrow_idle_cores;
+                record.advisory_notice = None;
+                record.tuning = tuned;
+
+                let event = ModelAuditEvent {
+                    timestamp_ms: current_timestamp_ms(),
+                    event_type: ModelAuditEventType::TuningProfileApplied,
+                    model_id: model_id.clone(),
+                    unprofiled: false,
+                    profile_status: "profiled".to_owned(),
+                    cluster: record.cluster.clone(),
+                    priority_class: record.priority_class.clone(),
+                    n_ctx: record.n_ctx,
+                    advisory_notice: None,
+                    details: format!(
+                        "applied operator tuning profile for model '{model_id}' (cluster: {}, n_ctx: {}, priority: {})",
+                        record.cluster, record.n_ctx, record.priority_class
+                    ),
+                };
+                audit_events
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(event);
+
+                Ok(AdminResponse::TuningProfileApplied(model_id))
+            }
+            AdminCommand::GetAuditEvents => {
+                let events = audit_events
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                Ok(AdminResponse::AuditEvents(events))
             }
         }
     }
@@ -1229,6 +1686,7 @@ impl ControlPlaneRuntime {
             &self.prefix_index,
             &self.queue_depth,
             &self.placements,
+            &self.audit_events,
             cmd,
         )
     }
@@ -1445,5 +1903,260 @@ mod tests {
             AdminResponse::ModelUnregistered("test-model".to_owned())
         );
         assert!(runtime.active_model_placements().is_empty());
+    }
+
+    #[test]
+    fn test_unprofiled_model_registration_and_status_query() {
+        let runtime = build_test_runtime();
+
+        let reg = runtime
+            .execute_admin(AdminCommand::RegisterModel {
+                model_id: "qwen2.5-7b".to_owned(),
+                weights_path: PathBuf::from("/models/qwen2.5-7b.gguf"),
+                cluster: "x100".to_owned(),
+            })
+            .expect("register model");
+        assert_eq!(reg, AdminResponse::ModelRegistered("qwen2.5-7b".to_owned()));
+
+        // Query status via AdminCommand
+        let status_resp = runtime
+            .execute_admin(AdminCommand::GetModelStatus {
+                model_id: "qwen2.5-7b".to_owned(),
+            })
+            .expect("get model status");
+
+        match status_resp {
+            AdminResponse::ModelStatus(entry) => {
+                assert_eq!(entry.id, "qwen2.5-7b");
+                assert_eq!(entry.object, "model");
+                assert_eq!(entry.owned_by, "k3");
+                assert!(entry.unprofiled);
+                assert_eq!(entry.profile_status, "unprofiled");
+                assert_eq!(entry.priority_class, "throughput");
+                assert_eq!(entry.cluster, "x100");
+                assert_eq!(entry.a100_cores, 0);
+                assert_eq!(entry.n_ctx, CONSERVATIVE_DEFAULT_N_CTX);
+                assert!(!entry.lend_idle_cores);
+                assert!(!entry.borrow_idle_cores);
+                assert_eq!(
+                    entry.advisory_notice.as_deref(),
+                    Some(CONSERVATIVE_TUNING_ADVISORY)
+                );
+            }
+            other => panic!("expected ModelStatus response, got {other:?}"),
+        }
+
+        // Query status for nonexistent model fails
+        let err = runtime
+            .execute_admin(AdminCommand::GetModelStatus {
+                model_id: "nonexistent".to_owned(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ManagerError::ModelNotFound(_)));
+    }
+
+    #[test]
+    fn test_v1_models_listing_and_json_serialization() {
+        let runtime = build_test_runtime();
+
+        runtime
+            .execute_admin(AdminCommand::RegisterModel {
+                model_id: "model-b".to_owned(),
+                weights_path: PathBuf::from("/models/model-b.gguf"),
+                cluster: "x100".to_owned(),
+            })
+            .expect("register model-b");
+
+        runtime
+            .execute_admin(AdminCommand::RegisterModel {
+                model_id: "model-a".to_owned(),
+                weights_path: PathBuf::from("/models/model-a.gguf"),
+                cluster: "x100".to_owned(),
+            })
+            .expect("register model-a");
+
+        // ListModels via AdminCommand
+        let list_resp = runtime
+            .execute_admin(AdminCommand::ListModels)
+            .expect("list models");
+        match list_resp {
+            AdminResponse::ModelList(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].id, "model-a");
+                assert_eq!(entries[1].id, "model-b");
+                assert!(entries[0].unprofiled);
+                assert!(entries[1].unprofiled);
+            }
+            other => panic!("expected ModelList, got {other:?}"),
+        }
+
+        // Test v1_models_response & JSON serialization
+        let v1_resp = runtime.v1_models_response();
+        assert_eq!(v1_resp.object, "list");
+        assert_eq!(v1_resp.data.len(), 2);
+        assert_eq!(v1_resp.data[0].id, "model-a");
+
+        let json = runtime.v1_models_json().expect("serialize v1 models json");
+        assert!(json.contains("\"unprofiled\": true"));
+        assert!(json.contains("\"profile_status\": \"unprofiled\""));
+        assert!(json.contains("advisory_notice"));
+        assert!(json.contains(CONSERVATIVE_TUNING_ADVISORY));
+
+        let deserialized: ModelListResponse =
+            serde_json::from_str(&json).expect("deserialize ModelListResponse");
+        assert_eq!(deserialized, v1_resp);
+    }
+
+    #[test]
+    fn test_operator_tuning_profile_application_clears_unprofiled() {
+        let runtime = build_test_runtime();
+
+        runtime
+            .execute_admin(AdminCommand::RegisterModel {
+                model_id: "custom-model".to_owned(),
+                weights_path: PathBuf::from("/models/custom.gguf"),
+                cluster: "x100".to_owned(),
+            })
+            .expect("register custom-model");
+
+        // Verify initially unprofiled
+        let entry_initial = runtime.get_model_entry("custom-model").expect("found");
+        assert!(entry_initial.unprofiled);
+        assert_eq!(entry_initial.profile_status, "unprofiled");
+        assert!(entry_initial.advisory_notice.is_some());
+
+        // Apply operator tuning profile (ADR-031, ADR-032)
+        let mut custom_tuning = TuningProfile::conservative_default();
+        custom_tuning.apply_operator_tuning(
+            ComputePool::A100,
+            0,
+            8,
+            PriorityClass::Latency,
+            4096,
+            true,
+            false,
+        );
+
+        let apply_res = runtime
+            .execute_admin(AdminCommand::ApplyTuningProfile {
+                model_id: "custom-model".to_owned(),
+                profile: custom_tuning,
+            })
+            .expect("apply tuning profile");
+        assert_eq!(
+            apply_res,
+            AdminResponse::TuningProfileApplied("custom-model".to_owned())
+        );
+
+        // Verify status after tuning profile applied
+        let entry_tuned = runtime.get_model_entry("custom-model").expect("found");
+        assert!(!entry_tuned.unprofiled);
+        assert_eq!(entry_tuned.profile_status, "profiled");
+        assert_eq!(entry_tuned.priority_class, "latency");
+        assert_eq!(entry_tuned.cluster, "a100");
+        assert_eq!(entry_tuned.a100_cores, 8);
+        assert_eq!(entry_tuned.n_ctx, 4096);
+        assert!(entry_tuned.lend_idle_cores);
+        assert!(!entry_tuned.borrow_idle_cores);
+        assert_eq!(entry_tuned.advisory_notice, None);
+
+        // Attempting to apply tuning to nonexistent model fails
+        let err = runtime
+            .execute_admin(AdminCommand::ApplyTuningProfile {
+                model_id: "nonexistent".to_owned(),
+                profile: TuningProfile::conservative_default(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ManagerError::ModelNotFound(_)));
+    }
+
+    #[test]
+    fn test_audit_event_logging_lifecycle() {
+        let runtime = build_test_runtime();
+        runtime.clear_audit_events();
+        assert!(runtime.audit_events().is_empty());
+
+        // 1. Model registration emits ModelRegistered
+        runtime
+            .execute_admin(AdminCommand::RegisterModel {
+                model_id: "audit-model".to_owned(),
+                weights_path: PathBuf::from("/models/audit.gguf"),
+                cluster: "x100".to_owned(),
+            })
+            .expect("register model");
+
+        let events = runtime.audit_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, ModelAuditEventType::ModelRegistered);
+        assert_eq!(events[0].model_id, "audit-model");
+        assert!(events[0].unprofiled);
+        assert_eq!(events[0].profile_status, "unprofiled");
+        assert_eq!(events[0].advisory(), Some(CONSERVATIVE_TUNING_ADVISORY));
+
+        // 2. Querying status emits ModelStatusQueried
+        let _ = runtime
+            .execute_admin(AdminCommand::GetModelStatus {
+                model_id: "audit-model".to_owned(),
+            })
+            .expect("get status");
+
+        let events = runtime.audit_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[1].event_type,
+            ModelAuditEventType::ModelStatusQueried
+        );
+        assert_eq!(events[1].model_id, "audit-model");
+        assert!(events[1].unprofiled);
+
+        // 3. Applying tuning profile emits TuningProfileApplied
+        let mut profile = TuningProfile::conservative_default();
+        profile.apply_operator_tuning(
+            ComputePool::X100,
+            4,
+            0,
+            PriorityClass::Throughput,
+            1024,
+            false,
+            false,
+        );
+
+        runtime
+            .apply_tuning_profile("audit-model", profile)
+            .expect("apply tuning");
+
+        let events = runtime.audit_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[2].event_type,
+            ModelAuditEventType::TuningProfileApplied
+        );
+        assert_eq!(events[2].model_id, "audit-model");
+        assert!(!events[2].unprofiled);
+        assert_eq!(events[2].profile_status, "profiled");
+        assert_eq!(events[2].advisory(), None);
+
+        // 4. Admin query for audit events returns complete list
+        match runtime
+            .execute_admin(AdminCommand::GetAuditEvents)
+            .expect("get audit events")
+        {
+            AdminResponse::AuditEvents(admin_events) => {
+                assert_eq!(admin_events.len(), 3);
+                assert_eq!(
+                    admin_events[0].event_type,
+                    ModelAuditEventType::ModelRegistered
+                );
+                assert_eq!(
+                    admin_events[1].event_type,
+                    ModelAuditEventType::ModelStatusQueried
+                );
+                assert_eq!(
+                    admin_events[2].event_type,
+                    ModelAuditEventType::TuningProfileApplied
+                );
+            }
+            other => panic!("expected AuditEvents response, got {other:?}"),
+        }
     }
 }

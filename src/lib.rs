@@ -38,6 +38,12 @@ pub use error::ManagerError;
 pub use health::{
     HealthSupervisor, HealthSupervisorConfig, RecoveryAction, RecoveryAuditEvent, RecoveryTarget,
 };
+pub use k3_core::profile::{
+    CONSERVATIVE_DEFAULT_A100_CORES, CONSERVATIVE_DEFAULT_N_CTX, CONSERVATIVE_DEFAULT_X100_CORES,
+    CONSERVATIVE_TUNING_ADVISORY, CONSTRAINED_TEST_N_CTX, ComputePool, CostProfile, ModelEntry,
+    ModelListResponse, ModelLoadAuditEvent, ModelProfile, PriorityClass, ProfileStatus,
+    TuningProfile,
+};
 pub use prefix::{
     BLOCK_SIZE_TOKENS, BlockTokens, PrefixCacheStats, PrefixMatchResult, PrefixRadixIndex,
 };
@@ -49,7 +55,8 @@ pub use prompt::{
 };
 pub use runtime::{
     ActiveTaskRecord, AdminCommand, AdminResponse, ControlPlaneRuntime, DEFAULT_CONTROL_TASK_LEASE,
-    TaskLeaseSnapshot, WorkerHealthSnapshot,
+    ModelAuditEvent, ModelAuditEventType, ModelPlacementRecord, TaskLeaseSnapshot,
+    WorkerHealthSnapshot,
 };
 pub use supervisor::{
     DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_PASS_TIMEOUT, ManagedWorker, WorkerPlacement,

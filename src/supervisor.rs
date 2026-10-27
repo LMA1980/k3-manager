@@ -16,13 +16,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::capacity::ResolvedControlCapacityExt;
-use k3_core::affinity::{ControlPlaneCapacityConfig, ResolvedControlCapacity};
+use k3_core::affinity::{
+    ControlPlaneCapacityConfig, DEFAULT_X100_MAX_COMPUTE_CORES, ResolvedControlCapacity,
+};
 use k3_core::ipc::layout::{ArenaHeader, KvBlockMeta, KvBlockTag};
 use k3_core::ipc::protocol::{
     AttachArenaCommand, IpcMessage, StatusCode, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
     recv_frame, recv_msg_frame, send_msg_frame,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
+use k3_core::profile::TuningProfile;
 
 use crate::dispatch::{ForwardPassRequest, ForwardPassResult, dispatch_forward_pass};
 use crate::domain::{
@@ -111,6 +114,8 @@ pub struct WorkerPlacement {
     pub heartbeat_timeout: Option<Duration>,
     /// Forward pass timeout threshold override.
     pub pass_timeout: Option<Duration>,
+    /// Authoritative tuning profile configuration (ADR-031, ADR-032).
+    pub tuning: Option<TuningProfile>,
 }
 
 impl WorkerPlacement {
@@ -133,6 +138,46 @@ impl WorkerPlacement {
             worker_binary: None,
             heartbeat_timeout: None,
             pass_timeout: None,
+            tuning: None,
+        }
+    }
+
+    /// Attaches an operator tuning profile or conservative default.
+    #[must_use]
+    pub fn with_tuning(mut self, tuning: TuningProfile) -> Self {
+        self.tuning = Some(tuning);
+        self
+    }
+
+    /// Attaches a tuning profile.
+    #[must_use]
+    pub fn with_profile(mut self, profile: TuningProfile) -> Self {
+        self.tuning = Some(profile);
+        self
+    }
+
+    /// Creates an unprofiled placement with conservative defaults (ADR-028, ADR-031).
+    #[must_use]
+    pub fn unprofiled(
+        model_id: impl Into<String>,
+        weights_path: impl Into<PathBuf>,
+        socket_path: impl Into<PathBuf>,
+    ) -> Self {
+        let model_id_str = model_id.into();
+        let mut tuning = TuningProfile::conservative_default();
+        tuning.model_id = Some(model_id_str.clone());
+        Self {
+            model_id: model_id_str,
+            weights_path: weights_path.into(),
+            socket_path: socket_path.into(),
+            cluster: "x100".to_owned(),
+            threads: Some(u32::try_from(DEFAULT_X100_MAX_COMPUTE_CORES).unwrap_or(6)),
+            memlock_limit: None,
+            affinity: None,
+            worker_binary: None,
+            heartbeat_timeout: None,
+            pass_timeout: None,
+            tuning: Some(tuning),
         }
     }
 
@@ -206,6 +251,24 @@ impl ManagedWorker {
     #[must_use]
     pub const fn placement(&self) -> &WorkerPlacement {
         &self.placement
+    }
+
+    /// Returns the context window limit in tokens.
+    #[must_use]
+    pub const fn n_ctx(&self) -> u32 {
+        self.n_ctx
+    }
+
+    /// Returns the attached tuning profile, if any.
+    #[must_use]
+    pub fn tuning(&self) -> Option<&TuningProfile> {
+        self.placement.tuning.as_ref()
+    }
+
+    /// Returns `true` if this worker is running under unprofiled conservative defaults.
+    #[must_use]
+    pub fn is_unprofiled(&self) -> bool {
+        self.placement.tuning.as_ref().is_none_or(|t| t.unprofiled)
     }
 
     /// Returns the model identifier.
@@ -1127,7 +1190,7 @@ impl WorkerSupervisor {
     #[allow(clippy::missing_panics_doc)]
     pub fn spawn_worker(
         &mut self,
-        placement: WorkerPlacement,
+        mut placement: WorkerPlacement,
         arena: SharedMemoryArena,
         arena_id: u64,
         arena_bytes: usize,
@@ -1138,6 +1201,50 @@ impl WorkerSupervisor {
         validate_model_id(&placement.model_id)?;
         self.capacity.validate_worker_placement(&placement)?;
         let compute_mask = resolve_worker_compute_mask(&placement)?;
+
+        // Enforce unprofiled conservative defaults and operator tuning invariants (US-07 Scenario 1, ADR-028, ADR-030, ADR-031)
+        let is_unprofiled = placement.tuning.as_ref().is_none_or(|t| t.unprofiled);
+
+        if is_unprofiled {
+            // Unprofiled models must reside on X100 only (a100_cores == 0 per ADR-028)
+            if !placement.cluster.eq_ignore_ascii_case("x100") {
+                return Err(ManagerError::Affinity(k3_core::K3Error::AffinityError {
+                    requested_mask: compute_mask,
+                    requested_threads: placement.threads.unwrap_or(0) as usize,
+                    reason: format!(
+                        "unprofiled model '{}' cannot be placed on cluster '{}'; unprofiled defaults require X100 compute pool only (ADR-028, ADR-031)",
+                        placement.model_id, placement.cluster
+                    ),
+                }));
+            }
+
+            // Unprofiled models cannot enable dynamic idle core lending or borrowing (ADR-030) or allocate A100 cores
+            if let Some(ref t) = placement.tuning {
+                if t.a100_cores > 0 {
+                    return Err(ManagerError::Affinity(k3_core::K3Error::AffinityError {
+                        requested_mask: compute_mask,
+                        requested_threads: placement.threads.unwrap_or(0) as usize,
+                        reason: format!(
+                            "unprofiled model '{}' cannot allocate A100 cores (a100_cores: {}); unprofiled defaults require a100_cores == 0 (ADR-028, ADR-031)",
+                            placement.model_id, t.a100_cores
+                        ),
+                    }));
+                }
+                if t.lend_idle_cores || t.borrow_idle_cores {
+                    return Err(ManagerError::WorkerSpawn(format!(
+                        "unprofiled model '{}' cannot enable dynamic idle core lending or borrowing (ADR-030)",
+                        placement.model_id
+                    )));
+                }
+            }
+
+            // Attach conservative defaults if not explicitly set
+            if placement.tuning.is_none() {
+                let mut def = TuningProfile::conservative_default_with_n_ctx(n_ctx as usize);
+                def.model_id = Some(placement.model_id.clone());
+                placement.tuning = Some(def);
+            }
+        }
 
         // If a worker with this model_id already exists, cleanly tear it down first
         if let Some(mut existing) = self.workers.remove(&placement.model_id) {
@@ -1321,5 +1428,87 @@ impl WorkerSupervisor {
 impl Drop for WorkerSupervisor {
     fn drop(&mut self) {
         self.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k3_core::profile::PriorityClass;
+
+    #[test]
+    fn test_worker_placement_unprofiled_constructor() {
+        let placement =
+            WorkerPlacement::unprofiled("unprofiled-model", "/weights/test.gguf", "/tmp/test.sock");
+        assert_eq!(placement.model_id, "unprofiled-model");
+        assert_eq!(placement.cluster, "x100");
+        assert_eq!(placement.threads, Some(6));
+        assert!(placement.affinity.is_none());
+        assert!(placement.tuning.is_some());
+
+        let tuning = placement.tuning.as_ref().unwrap();
+        assert!(tuning.unprofiled);
+        assert_eq!(tuning.cluster, "x100");
+        assert_eq!(tuning.a100_cores, 0);
+        assert_eq!(tuning.x100_cores, 6);
+        assert_eq!(tuning.priority_class, PriorityClass::Throughput);
+        assert!(!tuning.lend_idle_cores);
+        assert!(!tuning.borrow_idle_cores);
+    }
+
+    #[test]
+    fn test_spawn_worker_rejects_unprofiled_on_a100() {
+        let dummy_weights = PathBuf::from("/tmp/weights.gguf");
+        let dummy_socket = PathBuf::from("/tmp/socket.sock");
+        let arena = SharedMemoryArena::create("a100_unprofiled_arena", 4096).expect("create arena");
+        let mut supervisor = WorkerSupervisor::new();
+
+        // 8 threads on A100 passes capacity check, but unprofiled defaults require X100 only (ADR-028, ADR-031)
+        let placement =
+            WorkerPlacement::new("unprofiled_a100", &dummy_weights, &dummy_socket, "a100")
+                .with_threads(8);
+
+        let dup_arena = arena
+            .duplicate_fd()
+            .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+            .expect("dup arena");
+
+        let err = supervisor
+            .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+            .unwrap_err();
+
+        assert!(matches!(err, ManagerError::Affinity(_)));
+        let err_str = format!("{err}");
+        assert!(err_str.contains("unprofiled defaults require X100 compute pool only"));
+    }
+
+    #[test]
+    fn test_spawn_worker_rejects_unprofiled_with_core_lending() {
+        let dummy_weights = PathBuf::from("/tmp/weights.gguf");
+        let dummy_socket = PathBuf::from("/tmp/socket.sock");
+        let arena =
+            SharedMemoryArena::create("lending_unprofiled_arena", 4096).expect("create arena");
+        let mut supervisor = WorkerSupervisor::new();
+
+        let mut unprofiled_tuning = TuningProfile::conservative_default();
+        unprofiled_tuning.lend_idle_cores = true;
+
+        let placement =
+            WorkerPlacement::new("unprofiled_lend", &dummy_weights, &dummy_socket, "x100")
+                .with_threads(4)
+                .with_tuning(unprofiled_tuning);
+
+        let dup_arena = arena
+            .duplicate_fd()
+            .and_then(|fd| SharedMemoryArena::from_existing_fd(fd, 4096, "dup", false))
+            .expect("dup arena");
+
+        let err = supervisor
+            .spawn_worker(placement, dup_arena, 1, 4096, 64, 4)
+            .unwrap_err();
+
+        assert!(matches!(err, ManagerError::WorkerSpawn(_)));
+        let err_str = format!("{err}");
+        assert!(err_str.contains("cannot enable dynamic idle core lending or borrowing"));
     }
 }
