@@ -109,10 +109,9 @@ fn test_scenario2_runaway_workload_recovery_e2e() {
 
     let mock_affinity = Arc::new(MockOsAffinityBackend::default());
 
-    let domain_ctrl = Arc::new(
-        CgroupV2DomainController::default()
-            .with_affinity_backend(Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>),
-    );
+    let domain_ctrl = Arc::new(CgroupV2DomainController::default().with_affinity_backend(
+        Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>,
+    ));
     let mut supervisor = WorkerSupervisor::new()
         .with_capacity(capacity.clone())
         .with_domain_controller(domain_ctrl)
@@ -282,18 +281,19 @@ fn test_scenario2_runaway_workload_recovery_e2e() {
     let cancel_clone = Arc::clone(&cancel_flag);
 
     // Dispatch a runaway control-plane task with a 50ms lease that simulates an infinite loop
-    let runaway_res: Result<(), ManagerError> = control_runtime.dispatch_cancellable_task_with_lease(
-        Duration::from_millis(50),
-        move |token, _core| {
+    let runaway_res: Result<(), ManagerError> = control_runtime
+        .dispatch_cancellable_task_with_lease(Duration::from_millis(50), move |token, _core| {
             while !token.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(5));
             }
             cancel_clone.store(true, Ordering::SeqCst);
-        },
-    );
+        });
 
     // Assert that the lease expired and preemption error was returned
-    assert!(runaway_res.is_err(), "runaway control task must be preempted");
+    assert!(
+        runaway_res.is_err(),
+        "runaway control task must be preempted"
+    );
     match runaway_res.unwrap_err() {
         ManagerError::WorkerUnresponsive {
             model_id: err_model,

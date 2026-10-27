@@ -15,9 +15,7 @@ use std::time::Duration;
 
 use k3_core::affinity::ControlPlaneCapacityConfig;
 use k3_core::ipc::layout::ArenaHeader;
-use k3_core::ipc::protocol::{
-    IpcMessage, WorkerHeartbeatResponse, recv_msg_frame, send_msg_frame,
-};
+use k3_core::ipc::protocol::{IpcMessage, WorkerHeartbeatResponse, recv_msg_frame, send_msg_frame};
 use k3_core::ipc::shm::SharedMemoryArena;
 use k3_manager::domain::MockOsAffinityBackend;
 use k3_manager::{
@@ -38,10 +36,7 @@ fn init_dummy_arena(name: &str) -> SharedMemoryArena {
     let slice = arena.slice_mut(0, 128).expect("slice hdr");
     // SAFETY: Transmuting valid aligned ArenaHeader struct to its byte representation
     let hdr_bytes = unsafe {
-        std::slice::from_raw_parts(
-            (&raw const hdr).cast::<u8>(),
-            size_of::<ArenaHeader>(),
-        )
+        std::slice::from_raw_parts((&raw const hdr).cast::<u8>(), size_of::<ArenaHeader>())
     };
     slice[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
     arena
@@ -133,7 +128,10 @@ fn test_sub_issue_75_forward_pass_timeout_returns_worker_unresponsive() {
 
     let req = ForwardPassRequest::new_prefill(1001, 1, vec![1, 2, 3], vec![0]);
     let res = worker.execute_forward_pass(&req);
-    assert!(res.is_err(), "forward pass must fail on unresponsive socket");
+    assert!(
+        res.is_err(),
+        "forward pass must fail on unresponsive socket"
+    );
 
     match res.unwrap_err() {
         ManagerError::WorkerUnresponsive {

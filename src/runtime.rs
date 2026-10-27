@@ -296,12 +296,18 @@ impl ControlPlaneRuntime {
     /// Returns the default control task lease duration.
     #[must_use]
     pub fn default_lease_duration(&self) -> Duration {
-        *self.default_lease_duration.read().unwrap_or_else(PoisonError::into_inner)
+        *self
+            .default_lease_duration
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Sets the default control task lease duration.
     pub fn set_default_lease_duration(&self, duration: Duration) {
-        *self.default_lease_duration.write().unwrap_or_else(PoisonError::into_inner) = duration;
+        *self
+            .default_lease_duration
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = duration;
     }
 
     /// Sets the default control task lease duration using builder syntax.
@@ -502,9 +508,8 @@ impl ControlPlaneRuntime {
         let active_tasks_ref = Arc::clone(&self.active_tasks);
 
         let boxed_task = Box::new(move |core: usize| {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                f(cancel_clone, core)
-            }));
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(cancel_clone, core)));
             {
                 let mut tasks = active_tasks_ref
                     .write()
@@ -520,7 +525,9 @@ impl ControlPlaneRuntime {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
             tasks.remove(&task_id);
-            return Err(ManagerError::WorkerIpc("control worker thread is dead".to_owned()));
+            return Err(ManagerError::WorkerIpc(
+                "control worker thread is dead".to_owned(),
+            ));
         }
 
         let wait_timeout = lease_duration.saturating_add(Duration::from_millis(500));

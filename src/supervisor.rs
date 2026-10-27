@@ -324,7 +324,9 @@ impl ManagedWorker {
         n_ctx: u32,
         max_blocks: u32,
     ) -> Self {
-        let heartbeat_timeout = placement.heartbeat_timeout.unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT);
+        let heartbeat_timeout = placement
+            .heartbeat_timeout
+            .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT);
         let pass_timeout = placement.pass_timeout.unwrap_or(DEFAULT_PASS_TIMEOUT);
         Self {
             placement,
@@ -1128,9 +1130,7 @@ impl WorkerSupervisor {
         let heartbeat_timeout = placement
             .heartbeat_timeout
             .unwrap_or(self.default_heartbeat_timeout);
-        let pass_timeout = placement
-            .pass_timeout
-            .unwrap_or(self.default_pass_timeout);
+        let pass_timeout = placement.pass_timeout.unwrap_or(self.default_pass_timeout);
 
         let worker = ManagedWorker {
             placement,

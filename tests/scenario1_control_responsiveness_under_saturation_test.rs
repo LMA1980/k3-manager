@@ -102,7 +102,7 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
         .resolve_default()
         .expect("valid control capacity");
     assert_eq!(capacity.active_control_mask(), 0x00C0); // cores 6-7
-    assert_eq!(capacity.spare_recovery_mask(), 0x0020);  // core 5
+    assert_eq!(capacity.spare_recovery_mask(), 0x0020); // core 5
     assert_eq!(capacity.x100_compute_cap_mask(), 0x003F); // cores 0-5
 
     let mock_affinity = Arc::new(MockOsAffinityBackend::default());
@@ -246,7 +246,8 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
             let mut req_id = 6000_u64;
             while forward_pass_running.load(Ordering::Relaxed) {
                 req_id += 1;
-                let req = ForwardPassRequest::new_prefill(req_id, 1, prompt_tokens.clone(), vec![0]);
+                let req =
+                    ForwardPassRequest::new_prefill(req_id, 1, prompt_tokens.clone(), vec![0]);
                 if let Ok(mut ws) = ws_clone.lock() {
                     let _ = ws.forward_pass(model_id, &req);
                     forward_pass_counter_clone.fetch_add(1, Ordering::Relaxed);
@@ -288,8 +289,16 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
         assert_eq!(match_res.uncached_token_count(), 4);
 
         // 4. Stop-sequence detection
-        assert!(control_runtime.is_stop_token(model_id, 2).expect("stop token check"));
-        assert!(!control_runtime.is_stop_token(model_id, 1001).expect("stop token check"));
+        assert!(
+            control_runtime
+                .is_stop_token(model_id, 2)
+                .expect("stop token check")
+        );
+        assert!(
+            !control_runtime
+                .is_stop_token(model_id, 1001)
+                .expect("stop token check")
+        );
         assert!(
             control_runtime
                 .is_stop_sequence(model_id, "output stream <|im_end|>")

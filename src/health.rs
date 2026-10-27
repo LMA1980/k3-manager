@@ -20,7 +20,9 @@ use k3_core::affinity::ResolvedControlCapacity;
 use crate::domain::{OsAffinityBackend, RealOsAffinityBackend};
 use crate::error::ManagerError;
 use crate::runtime::ControlPlaneRuntime;
-use crate::supervisor::{DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_PASS_TIMEOUT, ManagedWorker, WorkerSupervisor};
+use crate::supervisor::{
+    DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_PASS_TIMEOUT, ManagedWorker, WorkerSupervisor,
+};
 
 /// Target entity subject to recovery intervention.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,9 +429,7 @@ impl HealthSupervisor {
             let Ok(mut ws) = ws_lock.try_lock() else {
                 // Lock held by client dispatch thread; append any control task events and return
                 if !new_events.is_empty() {
-                    let mut log = audit_events
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
+                    let mut log = audit_events.lock().unwrap_or_else(PoisonError::into_inner);
                     log.extend(new_events.clone());
                 }
                 return new_events;
@@ -530,9 +530,7 @@ impl HealthSupervisor {
         }
 
         if !new_events.is_empty() {
-            let mut log = audit_events
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut log = audit_events.lock().unwrap_or_else(PoisonError::into_inner);
             log.extend(new_events.clone());
         }
 
