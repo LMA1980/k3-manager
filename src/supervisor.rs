@@ -351,7 +351,7 @@ impl ManagedWorker {
     pub fn is_alive(&mut self) -> bool {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
-                Ok(None) => self.is_alive,
+                Ok(None) => true,
                 Ok(Some(_status)) => {
                     self.is_alive = false;
                     false
@@ -381,23 +381,36 @@ impl ManagedWorker {
                     "failed to send signal {signal} to pid {pid}: {err}"
                 )));
             }
-            self.is_alive = false;
-            // Close stream immediately to mirror socket termination
-            self.stream = None;
+
+            if signal == libc::SIGSTOP {
+                // Suspended process remains alive in OS; stream remains open
+                return Ok(());
+            }
 
             // Wait briefly for kernel to deliver signal and record exit status
             let start = Instant::now();
-            while start.elapsed() < Duration::from_millis(200) {
+            while start.elapsed() < Duration::from_millis(50) {
                 if let Ok(Some(_)) = child.try_wait() {
-                    break;
+                    self.is_alive = false;
+                    self.stream = None;
+                    return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
+
+            if let Ok(Some(_)) = child.try_wait() {
+                self.is_alive = false;
+                self.stream = None;
+            }
+
             Ok(())
         } else {
-            Err(ManagerError::WorkerIpc(
-                "worker child process is not running".to_owned(),
-            ))
+            if signal == libc::SIGSTOP {
+                return Ok(());
+            }
+            self.is_alive = false;
+            self.stream = None;
+            Ok(())
         }
     }
 
@@ -455,7 +468,11 @@ impl ManagedWorker {
 
         if let Err(e) = send_msg_frame(stream, &req, None) {
             let elapsed_ms = t0.elapsed().as_millis() as u64;
-            if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+            let is_timeout = e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut
+                || e.raw_os_error() == Some(libc::EAGAIN)
+                || e.raw_os_error() == Some(libc::ETIMEDOUT);
+            if is_timeout {
                 self.has_timed_out = true;
                 return Err(ManagerError::WorkerUnresponsive {
                     model_id: self.placement.model_id.clone(),
@@ -472,7 +489,11 @@ impl ManagedWorker {
             Ok(r) => r,
             Err(e) => {
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
-                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                let is_timeout = e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.raw_os_error() == Some(libc::EAGAIN)
+                    || e.raw_os_error() == Some(libc::ETIMEDOUT);
+                if is_timeout {
                     self.has_timed_out = true;
                     return Err(ManagerError::WorkerUnresponsive {
                         model_id: self.placement.model_id.clone(),
@@ -585,6 +606,8 @@ impl ManagedWorker {
                     ManagerError::Io(io_err) => {
                         io_err.kind() == std::io::ErrorKind::WouldBlock
                             || io_err.kind() == std::io::ErrorKind::TimedOut
+                            || io_err.raw_os_error() == Some(libc::EAGAIN)
+                            || io_err.raw_os_error() == Some(libc::ETIMEDOUT)
                     }
                     ManagerError::WorkerIpc(msg) => {
                         msg.contains("timed out")

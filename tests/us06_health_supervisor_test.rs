@@ -10,7 +10,7 @@
 use std::mem::size_of;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use k3_core::affinity::ControlPlaneCapacityConfig;
@@ -22,7 +22,7 @@ use k3_core::ipc::shm::SharedMemoryArena;
 use k3_manager::domain::MockOsAffinityBackend;
 use k3_manager::{
     ControlPlaneRuntime, ForwardPassRequest, HealthSupervisor, ManagedWorker, ManagerError,
-    RecoveryAction, RecoveryTarget, SimpleTokenizer, WorkerPlacement,
+    RecoveryAction, RecoveryTarget, SimpleTokenizer, WorkerPlacement, WorkerSupervisor,
 };
 
 fn init_dummy_arena(name: &str) -> SharedMemoryArena {
@@ -45,6 +45,26 @@ fn init_dummy_arena(name: &str) -> SharedMemoryArena {
     };
     slice[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
     arena
+}
+
+fn unique_socket_path(prefix: &str) -> std::path::PathBuf {
+    let pid = std::process::id();
+    let seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}_{pid}_{seq}.sock"))
+}
+
+fn create_dummy_weights(name: &str) -> std::path::PathBuf {
+    let pid = std::process::id();
+    let seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("{name}_{pid}_{seq}.gguf"));
+    let _ = std::fs::write(&path, b"GGUF_TEST_SYNTHETIC_MODEL_WEIGHTS_UNIT");
+    path
 }
 
 // ============================================================================
@@ -315,4 +335,82 @@ fn test_sub_issue_76_audit_events_recording_and_clearing() {
 
     supervisor.clear_audit_events();
     assert!(supervisor.audit_events().is_empty());
+}
+
+#[test]
+fn test_sub_issue_76_watchdog_thread_affinity_failure_propagates_error() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    // Configure affinity to fail on PID 0
+    mock_affinity.fail_pid(0);
+
+    let mut supervisor = HealthSupervisor::with_affinity_backend(
+        capacity,
+        Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>,
+    )
+    .expect("create health supervisor");
+
+    let start_res = supervisor.start_watchdog();
+    assert!(start_res.is_err(), "affinity failure must be propagated");
+    match start_res.unwrap_err() {
+        ManagerError::Affinity(_) => {}
+        other => panic!("expected ManagerError::Affinity, got {other:?}"),
+    }
+    assert!(!supervisor.is_watchdog_running());
+}
+
+#[test]
+fn test_sub_issue_76_check_once_detects_unresponsive_worker_and_recovers() {
+    let capacity = ControlPlaneCapacityConfig::default()
+        .resolve_default()
+        .expect("valid capacity");
+
+    let mock_affinity = Arc::new(MockOsAffinityBackend::default());
+    let mut ws = WorkerSupervisor::new().with_capacity(capacity.clone());
+
+    let (mgr_sock, dummy_worker) = UnixStream::pair().expect("socketpair");
+    let arena = init_dummy_arena("shm_check_once");
+
+    let sock_path = unique_socket_path("check_once_sock");
+    let weights_path = create_dummy_weights("check_once_weights");
+
+    let placement = WorkerPlacement::new("worker-unresp", weights_path, sock_path, "x100")
+        .with_heartbeat_timeout(Duration::from_millis(50));
+
+    let worker = ManagedWorker::create_test_worker(placement, mgr_sock, arena, 1, 65536, 64, 4);
+    ws.register_worker(worker);
+
+    let ws_arc = Arc::new(Mutex::new(ws));
+    let supervisor = HealthSupervisor::with_affinity_backend(
+        capacity,
+        Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>,
+    )
+    .expect("health supervisor")
+    .with_worker_supervisor(Arc::clone(&ws_arc));
+
+    // Dummy worker thread stalls without replying to heartbeat
+    let worker_stall = std::thread::spawn(move || {
+        let (msg, _) = recv_msg_frame(&dummy_worker).expect("dummy receive");
+        assert!(matches!(msg, IpcMessage::WorkerHeartbeatRequest(_)));
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = dummy_worker;
+    });
+
+    // Run synchronous single health check cycle
+    let events = supervisor.check_once();
+    assert_eq!(events.len(), 1, "exactly one recovery event expected");
+    assert!(
+        matches!(events[0].target, RecoveryTarget::ComputeWorker { ref model_id, .. } if model_id == "worker-unresp"),
+        "recovery target must be ComputeWorker 'worker-unresp'"
+    );
+    assert!(
+        events[0].reason.contains("timed out") || events[0].reason.contains("heartbeat"),
+        "failure reason must indicate heartbeat timeout: {}",
+        events[0].reason
+    );
+
+    let _ = worker_stall.join();
 }

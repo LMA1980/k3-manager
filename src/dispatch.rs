@@ -116,7 +116,7 @@ impl ForwardPassResult {
 ///
 /// # Errors
 /// Returns [`ManagerError`] on shared memory, IPC communication, or worker execution failure.
-#[allow(clippy::cast_ptr_alignment)]
+#[allow(clippy::too_many_lines, clippy::cast_ptr_alignment)]
 pub fn dispatch_forward_pass(
     stream: &UnixStream,
     arena: &mut SharedMemoryArena,
@@ -177,7 +177,11 @@ pub fn dispatch_forward_pass(
     });
 
     send_msg_frame(stream, &cmd, None).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+        let is_timeout = e.kind() == std::io::ErrorKind::WouldBlock
+            || e.kind() == std::io::ErrorKind::TimedOut
+            || e.raw_os_error() == Some(libc::EAGAIN)
+            || e.raw_os_error() == Some(libc::ETIMEDOUT);
+        if is_timeout {
             ManagerError::Io(e)
         } else {
             ManagerError::WorkerIpc(format!("failed to send ForwardPassCommand to worker: {e}"))
@@ -186,7 +190,11 @@ pub fn dispatch_forward_pass(
 
     // 6. Receive ForwardPassCompleted from worker
     let (reply, _) = recv_msg_frame(stream).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+        let is_timeout = e.kind() == std::io::ErrorKind::WouldBlock
+            || e.kind() == std::io::ErrorKind::TimedOut
+            || e.raw_os_error() == Some(libc::EAGAIN)
+            || e.raw_os_error() == Some(libc::ETIMEDOUT);
+        if is_timeout {
             ManagerError::Io(e)
         } else {
             ManagerError::WorkerIpc(format!(

@@ -169,7 +169,7 @@ pub struct ControlPlaneRuntime {
     control_workers: Arc<RwLock<Vec<ControlWorkerThread>>>,
     active_tasks: Arc<RwLock<HashMap<u64, ActiveTaskRecord>>>,
     next_task_id: Arc<AtomicU64>,
-    default_lease_duration: Duration,
+    default_lease_duration: Arc<RwLock<Duration>>,
 }
 
 impl ControlPlaneRuntime {
@@ -239,7 +239,7 @@ impl ControlPlaneRuntime {
             control_workers: Arc::new(RwLock::new(control_workers)),
             active_tasks: Arc::new(RwLock::new(HashMap::new())),
             next_task_id: Arc::new(AtomicU64::new(1)),
-            default_lease_duration: DEFAULT_CONTROL_TASK_LEASE,
+            default_lease_duration: Arc::new(RwLock::new(DEFAULT_CONTROL_TASK_LEASE)),
         })
     }
 
@@ -295,19 +295,19 @@ impl ControlPlaneRuntime {
 
     /// Returns the default control task lease duration.
     #[must_use]
-    pub const fn default_lease_duration(&self) -> Duration {
-        self.default_lease_duration
+    pub fn default_lease_duration(&self) -> Duration {
+        *self.default_lease_duration.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Sets the default control task lease duration.
-    pub fn set_default_lease_duration(&mut self, duration: Duration) {
-        self.default_lease_duration = duration;
+    pub fn set_default_lease_duration(&self, duration: Duration) {
+        *self.default_lease_duration.write().unwrap_or_else(PoisonError::into_inner) = duration;
     }
 
     /// Sets the default control task lease duration using builder syntax.
     #[must_use]
-    pub const fn with_default_lease_duration(mut self, duration: Duration) -> Self {
-        self.default_lease_duration = duration;
+    pub fn with_default_lease_duration(self, duration: Duration) -> Self {
+        self.set_default_lease_duration(duration);
         self
     }
 
@@ -559,6 +559,7 @@ impl ControlPlaneRuntime {
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                let _ = self.replace_worker_thread(core_id);
                 {
                     let mut tasks = self
                         .active_tasks
@@ -603,7 +604,7 @@ impl ControlPlaneRuntime {
         F: FnOnce(usize) -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.dispatch_control_task_with_lease(self.default_lease_duration, f)
+        self.dispatch_control_task_with_lease(self.default_lease_duration(), f)
     }
 
     /// Dispatches prompt formatting to execute on a dedicated active control thread (ADR-007).

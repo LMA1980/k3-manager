@@ -219,12 +219,14 @@ impl HealthSupervisor {
     /// Connects a [`ControlPlaneRuntime`] instance for control task lease monitoring and thread replacement.
     #[must_use]
     pub fn with_control_runtime(mut self, rt: Arc<ControlPlaneRuntime>) -> Self {
+        rt.set_default_lease_duration(self.config.task_lease_duration);
         self.control_runtime = Some(rt);
         self
     }
 
     /// Sets the [`ControlPlaneRuntime`] instance.
     pub fn set_control_runtime(&mut self, rt: Arc<ControlPlaneRuntime>) {
+        rt.set_default_lease_duration(self.config.task_lease_duration);
         self.control_runtime = Some(rt);
     }
 
@@ -264,8 +266,11 @@ impl HealthSupervisor {
 
     /// Sets control task lease duration using builder syntax.
     #[must_use]
-    pub const fn with_task_lease_duration(mut self, duration: Duration) -> Self {
+    pub fn with_task_lease_duration(mut self, duration: Duration) -> Self {
         self.config.task_lease_duration = duration;
+        if let Some(ref rt) = self.control_runtime {
+            rt.set_default_lease_duration(duration);
+        }
         self
     }
 
@@ -311,16 +316,22 @@ impl HealthSupervisor {
         let audit_events = Arc::clone(&self.audit_events);
         let check_interval = self.config.check_interval;
 
-        let (ready_tx, ready_rx) = sync_channel::<()>(1);
+        let (ready_tx, ready_rx) = sync_channel::<Result<(), ManagerError>>(1);
 
         let handle = std::thread::Builder::new()
             .name("k3-health-watchdog".to_string())
             .spawn(move || {
                 // Pin watchdog thread to spare recovery core (ADR-007, ADR-041)
-                if spare_mask != 0 {
-                    let _ = backend.set_affinity(0, spare_mask);
+                let aff_res = if spare_mask != 0 {
+                    backend.set_affinity(0, spare_mask)
+                } else {
+                    Ok(())
+                };
+                let is_ok = aff_res.is_ok();
+                let _ = ready_tx.send(aff_res);
+                if !is_ok {
+                    return;
                 }
-                let _ = ready_tx.send(());
 
                 while running.load(Ordering::Relaxed) {
                     Self::perform_health_check(ws_opt.as_ref(), rt_opt.as_ref(), &audit_events);
@@ -333,7 +344,11 @@ impl HealthSupervisor {
                 ))
             })?;
 
-        let _ = ready_rx.recv();
+        if let Ok(Err(e)) = ready_rx.recv() {
+            self.running.store(false, Ordering::SeqCst);
+            let _ = handle.join();
+            return Err(e);
+        }
         self.watchdog_handle = Some(handle);
         Ok(())
     }
@@ -451,11 +466,8 @@ impl HealthSupervisor {
                                     format!("heartbeat probe timed out after {elapsed_ms}ms");
                             }
                             Err(e) => {
-                                if !worker.is_alive() {
-                                    needs_recovery = true;
-                                    failure_reason =
-                                        format!("worker exited during heartbeat: {e}");
-                                }
+                                needs_recovery = true;
+                                failure_reason = format!("heartbeat probe failed: {e}");
                             }
                         }
                     }

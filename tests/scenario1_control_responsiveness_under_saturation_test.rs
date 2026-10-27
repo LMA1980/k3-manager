@@ -21,7 +21,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use k3_core::affinity::ControlPlaneCapacityConfig;
@@ -31,7 +31,8 @@ use k3_manager::dispatch::ForwardPassRequest;
 use k3_manager::domain::{CgroupV2DomainController, MockOsAffinityBackend};
 use k3_manager::supervisor::{WorkerPlacement, WorkerSupervisor};
 use k3_manager::{
-    AdminCommand, AdminResponse, ChatTemplate, ControlPlaneRuntime, SimpleTokenizer, SpecialTokens,
+    AdminCommand, AdminResponse, ChatTemplate, ControlPlaneRuntime, OsAffinityBackend,
+    SimpleTokenizer, SpecialTokens,
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(300);
@@ -110,7 +111,7 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
     let control_runtime = Arc::new(
         ControlPlaneRuntime::with_affinity_backend(
             capacity.clone(),
-            Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>,
+            Arc::clone(&mock_affinity) as Arc<dyn OsAffinityBackend>,
         )
         .expect("create control plane runtime"),
     );
@@ -149,7 +150,7 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
     // Create WorkerSupervisor using same mock affinity backend to monitor placement
     let domain_ctrl = Arc::new(
         CgroupV2DomainController::default()
-            .with_affinity_backend(Arc::clone(&mock_affinity) as Arc<dyn k3_manager::OsAffinityBackend>),
+            .with_affinity_backend(Arc::clone(&mock_affinity) as Arc<dyn OsAffinityBackend>),
     );
     let mut supervisor = WorkerSupervisor::new()
         .with_capacity(capacity.clone())
@@ -211,10 +212,13 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
     for thread_idx in 0..6 {
         let running_clone = Arc::clone(&compute_running);
         let counter_clone = Arc::clone(&pass_counter);
+        let aff_clone = Arc::clone(&mock_affinity);
 
         let handle = std::thread::Builder::new()
             .name(format!("compute-sat-{thread_idx}"))
             .spawn(move || {
+                let mask = 1_u64 << thread_idx;
+                let _ = aff_clone.set_affinity(0, mask);
                 let mut acc: u64 = 0;
                 while running_clone.load(Ordering::Relaxed) {
                     for _ in 0..15_000 {
@@ -228,13 +232,29 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
         compute_handles.push(handle);
     }
 
-    // Also execute real forward pass via supervisor while compute is warming up
-    let prompt_tokens = vec![101_u32, 102, 103, 104];
-    let req = ForwardPassRequest::new_prefill(5001, 1, prompt_tokens, vec![0]);
-    let prefill_res = supervisor
-        .forward_pass(model_id, &req)
-        .expect("forward pass on saturated worker");
-    assert!(prefill_res.completed.status.is_success());
+    let ws_arc = Arc::new(Mutex::new(supervisor));
+    let ws_clone = Arc::clone(&ws_arc);
+    let forward_pass_running = Arc::clone(&compute_running);
+    let forward_pass_counter = Arc::new(AtomicU64::new(0));
+    let forward_pass_counter_clone = Arc::clone(&forward_pass_counter);
+
+    // Continuous forward pass thread sustaining real model passes concurrently
+    let forward_pass_handle = std::thread::Builder::new()
+        .name("compute-continuous-passes".to_string())
+        .spawn(move || {
+            let prompt_tokens = vec![101_u32, 102, 103, 104];
+            let mut req_id = 6000_u64;
+            while forward_pass_running.load(Ordering::Relaxed) {
+                req_id += 1;
+                let req = ForwardPassRequest::new_prefill(req_id, 1, prompt_tokens.clone(), vec![0]);
+                if let Ok(mut ws) = ws_clone.lock() {
+                    let _ = ws.forward_pass(model_id, &req);
+                    forward_pass_counter_clone.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+        .expect("spawn forward pass loop");
 
     // Give saturation threads time to achieve 100% CPU utilization
     std::thread::sleep(Duration::from_millis(50));
@@ -320,11 +340,17 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
     for handle in compute_handles {
         let _ = handle.join();
     }
+    let _ = forward_pass_handle.join();
 
     let total_passes = pass_counter.load(Ordering::Relaxed);
+    let sustained_passes = forward_pass_counter.load(Ordering::Relaxed);
     assert!(
         total_passes > 50,
         "compute threads executed {total_passes} passes, confirming saturation"
+    );
+    assert!(
+        sustained_passes > 0,
+        "sustained continuous forward passes must be executed concurrently during test"
     );
 
     let avg_latency = latencies_micros.iter().sum::<u128>() as f64 / client_iterations as f64;
@@ -357,5 +383,6 @@ fn test_scenario1_control_responsiveness_under_saturation_e2e() {
     }
 
     // Cleanly shutdown worker
+    let mut supervisor = ws_arc.lock().expect("lock supervisor");
     supervisor.shutdown_all();
 }
