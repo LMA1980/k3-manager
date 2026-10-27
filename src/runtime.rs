@@ -193,7 +193,7 @@ impl ControlPlaneRuntime {
         affinity_backend: Arc<dyn OsAffinityBackend>,
     ) -> Result<Self, ManagerError> {
         let active_cores = capacity.active_control_cores.clone();
-        let mut control_workers = Vec::with_capacity(active_cores.len());
+        let mut control_workers: Vec<ControlWorkerThread> = Vec::with_capacity(active_cores.len());
 
         for &core_id in &active_cores {
             let (tx, rx) = channel::<Box<dyn FnOnce(usize) + Send>>();
@@ -228,10 +228,22 @@ impl ControlPlaneRuntime {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     let _ = handle.join();
+                    for mut w in control_workers {
+                        drop(w.sender);
+                        if let Some(h) = w.handle.take() {
+                            let _ = h.join();
+                        }
+                    }
                     return Err(e);
                 }
                 Err(_) => {
                     let _ = handle.join();
+                    for mut w in control_workers {
+                        drop(w.sender);
+                        if let Some(h) = w.handle.take() {
+                            let _ = h.join();
+                        }
+                    }
                     return Err(ManagerError::WorkerSpawn(format!(
                         "control worker thread for core {core_id} panicked during initialization"
                     )));
@@ -469,8 +481,11 @@ impl ControlPlaneRuntime {
             }
         }
 
+        let mut replaced_cores = std::collections::HashSet::new();
         for &(_task_id, core_id) in &expired {
-            let _ = self.replace_worker_thread(core_id);
+            if replaced_cores.insert(core_id) {
+                let _ = self.replace_worker_thread(core_id);
+            }
         }
 
         expired
@@ -1050,6 +1065,25 @@ impl ControlPlaneRuntime {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         map.remove(model_id);
+    }
+
+    /// Updates the worker health status, process ID, and generation counter for a model.
+    pub fn update_worker_health_with_pid(
+        &self,
+        model_id: &str,
+        pid: Option<u32>,
+        is_alive: bool,
+        generation: u64,
+    ) {
+        let mut map = self
+            .placements
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(record) = map.get_mut(model_id) {
+            record.pid = pid;
+            record.is_alive = is_alive;
+            record.generation = generation;
+        }
     }
 
     /// Updates the worker health status and generation counter for a model.

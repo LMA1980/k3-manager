@@ -481,7 +481,11 @@ impl ManagedWorker {
         let _ = stream.set_write_timeout(Some(self.heartbeat_timeout));
 
         let t0 = Instant::now();
-        let req = IpcMessage::WorkerHeartbeatRequest(WorkerHeartbeatRequest { timestamp_ns: 1 });
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let req = IpcMessage::WorkerHeartbeatRequest(WorkerHeartbeatRequest { timestamp_ns });
 
         if let Err(e) = send_msg_frame(stream, &req, None) {
             let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -524,13 +528,14 @@ impl ManagedWorker {
             }
         };
 
-        let latency = t0.elapsed();
-        self.last_heartbeat_latency = Some(latency);
-        self.last_heartbeat_time = Some(Instant::now());
-        self.has_timed_out = false;
-
         match reply {
-            IpcMessage::WorkerHeartbeatResponse(resp) => Ok(resp),
+            IpcMessage::WorkerHeartbeatResponse(resp) => {
+                let latency = t0.elapsed();
+                self.last_heartbeat_latency = Some(latency);
+                self.last_heartbeat_time = Some(Instant::now());
+                self.has_timed_out = false;
+                Ok(resp)
+            }
             other => Err(ManagerError::Protocol(format!(
                 "expected WorkerHeartbeatResponse, got {other:?}"
             ))),
@@ -883,6 +888,10 @@ fn spawn_and_attach_process(
         )));
     }
 
+    let attach_timeout = Duration::from_secs(5);
+    let _ = stream.set_read_timeout(Some(attach_timeout));
+    let _ = stream.set_write_timeout(Some(attach_timeout));
+
     // 5. Transfer shared-memory arena FD via SCM_RIGHTS (AttachArenaCommand / Type ID 201)
     let arena_fd = match arena.duplicate_fd() {
         Ok(fd) => fd,
@@ -1206,6 +1215,20 @@ impl WorkerSupervisor {
             .ok_or_else(|| ManagerError::ModelNotFound(model_id.to_owned()))?;
 
         worker.execute_forward_pass(req)
+    }
+
+    /// Dispatches a forward pass to the worker for `model_id`.
+    ///
+    /// Alias for [`forward_pass`](Self::forward_pass) fulfilling US-06.3 (#75) requirements.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError`] on failure.
+    pub fn dispatch_forward_pass(
+        &mut self,
+        model_id: &str,
+        req: &ForwardPassRequest,
+    ) -> Result<ForwardPassResult, ManagerError> {
+        self.forward_pass(model_id, req)
     }
 
     /// Reaps a crashed or exited worker process for `model_id`.

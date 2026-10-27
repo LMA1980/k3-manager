@@ -276,6 +276,12 @@ impl HealthSupervisor {
         self
     }
 
+    /// Returns the active supervisor configuration.
+    #[must_use]
+    pub const fn config(&self) -> &HealthSupervisorConfig {
+        &self.config
+    }
+
     /// Returns the active spare recovery mask.
     #[must_use]
     pub const fn spare_recovery_mask(&self) -> u64 {
@@ -325,6 +331,7 @@ impl HealthSupervisor {
         let rt_opt = self.control_runtime.clone();
         let audit_events = Arc::clone(&self.audit_events);
         let check_interval = self.config.check_interval;
+        let config_clone = self.config.clone();
 
         let (ready_tx, ready_rx) = sync_channel::<Result<(), ManagerError>>(1);
 
@@ -346,6 +353,7 @@ impl HealthSupervisor {
                 while running.load(Ordering::Relaxed) {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         Self::perform_health_check(
+                            &config_clone,
                             ws_opt.as_ref(),
                             rt_opt.as_ref(),
                             &audit_events,
@@ -361,10 +369,20 @@ impl HealthSupervisor {
                 ))
             })?;
 
-        if let Ok(Err(e)) = ready_rx.recv() {
-            self.running.store(false, Ordering::SeqCst);
-            let _ = handle.join();
-            return Err(e);
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.running.store(false, Ordering::SeqCst);
+                let _ = handle.join();
+                return Err(e);
+            }
+            Err(_) => {
+                self.running.store(false, Ordering::SeqCst);
+                let _ = handle.join();
+                return Err(ManagerError::WorkerSpawn(format!(
+                    "watchdog thread for spare core mask 0x{spare_mask:04X} panicked during initialization"
+                )));
+            }
         }
         self.watchdog_handle = Some(handle);
         Ok(())
@@ -383,6 +401,7 @@ impl HealthSupervisor {
     #[must_use]
     pub fn check_once(&self) -> Vec<RecoveryAuditEvent> {
         Self::perform_health_check(
+            &self.config,
             self.worker_supervisor.as_ref(),
             self.control_runtime.as_ref(),
             &self.audit_events,
@@ -414,6 +433,7 @@ impl HealthSupervisor {
 
     #[allow(clippy::too_many_lines)]
     fn perform_health_check(
+        config: &HealthSupervisorConfig,
         worker_supervisor: Option<&Arc<Mutex<WorkerSupervisor>>>,
         control_runtime: Option<&Arc<ControlPlaneRuntime>>,
         audit_events: &Arc<Mutex<Vec<RecoveryAuditEvent>>>,
@@ -456,6 +476,17 @@ impl HealthSupervisor {
                 let mut failure_reason = String::new();
 
                 if let Some(worker) = ws.get_worker_mut(&model_id) {
+                    let effective_pass_timeout = worker
+                        .placement()
+                        .pass_timeout
+                        .unwrap_or(config.pass_timeout);
+                    let effective_heartbeat_timeout = worker
+                        .placement()
+                        .heartbeat_timeout
+                        .unwrap_or(config.heartbeat_timeout);
+                    worker.set_pass_timeout(effective_pass_timeout);
+                    worker.set_heartbeat_timeout(effective_heartbeat_timeout);
+
                     if !worker.is_alive() {
                         needs_recovery = true;
                         failure_reason = "worker process terminated unexpectedly".to_string();
@@ -463,12 +494,12 @@ impl HealthSupervisor {
                         needs_recovery = true;
                         failure_reason = "worker socket I/O deadline breached".to_string();
                     } else if let Some(elapsed) = worker.active_pass_elapsed() {
-                        if elapsed > worker.pass_timeout() {
+                        if elapsed > effective_pass_timeout {
                             needs_recovery = true;
                             failure_reason = format!(
                                 "forward pass deadline exceeded (elapsed {}ms > {}ms limit)",
                                 elapsed.as_millis(),
-                                worker.pass_timeout().as_millis()
+                                effective_pass_timeout.as_millis()
                             );
                         }
                     } else {
@@ -533,7 +564,7 @@ impl HealthSupervisor {
                             new_events.push(event);
 
                             if let Some(rt) = control_runtime {
-                                rt.update_worker_health(&model_id, true, new_gen);
+                                rt.update_worker_health_with_pid(&model_id, new_pid, true, new_gen);
                             }
                         }
                         Err(e) => {
@@ -541,7 +572,7 @@ impl HealthSupervisor {
                                 "[health supervisor] failed to recover worker '{model_id}': {e}"
                             );
                             if let Some(rt) = control_runtime {
-                                rt.update_worker_health(&model_id, false, 0);
+                                rt.update_worker_health_with_pid(&model_id, None, false, 0);
                             }
                         }
                     }
