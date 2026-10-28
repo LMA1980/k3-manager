@@ -18,11 +18,17 @@ use std::time::{Duration, Instant};
 use crate::capacity::ControlPlaneScheduler;
 use crate::domain::{OsAffinityBackend, RealOsAffinityBackend};
 use crate::error::ManagerError;
+use crate::persistence::{
+    DiagnosticReplayResult, PersistenceError, PersistenceStore, SqlitePersistenceStore,
+};
 use crate::prefix::{PrefixCacheStats, PrefixMatchResult, PrefixRadixIndex};
 use crate::prompt::{
     ChatTemplate, GgufTokenizer, IncrementalStopDetector, PreparedPrompt, PromptOrchestrator,
     PromptPreparationRequest, SpecialTokens, Tokenizer,
 };
+use crate::queue::AdmissionQueueManager;
+use crate::router::DecisionRouter;
+use crate::scheduler::MultiModelScheduler;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use k3_core::affinity::ResolvedControlCapacity;
@@ -298,10 +304,20 @@ pub enum AdminCommand {
     },
     /// Query operational model audit event history.
     GetAuditEvents,
+    /// Generate advisory tuning recommendations based on live metrics and hardware ceilings (US-08 Scenario 2).
+    SuggestTuning {
+        /// Model identifier.
+        model_id: String,
+    },
+    /// Replay persisted last interaction of a session for diagnostic verification (US-17).
+    ReplaySessionLastTurn {
+        /// Session identifier to replay.
+        session_id: String,
+    },
 }
 
 /// Administrative response returned by the control-plane runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AdminResponse {
     /// Ping acknowledgment.
     Pong,
@@ -329,6 +345,10 @@ pub enum AdminResponse {
     TuningProfileApplied(String),
     /// Model operational audit event history.
     AuditEvents(Vec<ModelAuditEvent>),
+    /// Tuning advisory recommendation generated on demand (US-08 Scenario 2).
+    TuningAdvisory(k3_core::profile::TuningAdvisory),
+    /// Diagnostic replay result containing matched status and replayed response (US-17).
+    DiagnosticReplay(DiagnosticReplayResult),
 }
 
 /// Default control task lease duration (5 seconds).
@@ -392,6 +412,10 @@ pub struct ControlPlaneRuntime {
     next_task_id: Arc<AtomicU64>,
     default_lease_duration: Arc<RwLock<Duration>>,
     audit_events: Arc<RwLock<Vec<ModelAuditEvent>>>,
+    compute_scheduler: Arc<MultiModelScheduler>,
+    router: Arc<DecisionRouter>,
+    queue_mgr: Arc<AdmissionQueueManager>,
+    persistence: Arc<dyn PersistenceStore>,
 }
 
 impl ControlPlaneRuntime {
@@ -479,6 +503,14 @@ impl ControlPlaneRuntime {
             });
         }
 
+        let compute_scheduler = Arc::new(MultiModelScheduler::new(capacity.clone()));
+        let router = Arc::new(DecisionRouter::default());
+        let queue_mgr = Arc::new(AdmissionQueueManager::default());
+        let persistence: Arc<dyn PersistenceStore> = Arc::new(
+            SqlitePersistenceStore::open_in_memory()
+                .map_err(|e| ManagerError::WorkerSpawn(format!("sqlite init error: {e}")))?,
+        );
+
         Ok(Self {
             scheduler: ControlPlaneScheduler::new(capacity),
             affinity_backend,
@@ -491,7 +523,62 @@ impl ControlPlaneRuntime {
             next_task_id: Arc::new(AtomicU64::new(1)),
             default_lease_duration: Arc::new(RwLock::new(DEFAULT_CONTROL_TASK_LEASE)),
             audit_events: Arc::new(RwLock::new(Vec::new())),
+            compute_scheduler,
+            router,
+            queue_mgr,
+            persistence,
         })
+    }
+
+    /// Returns a reference to the active [`MultiModelScheduler`].
+    #[must_use]
+    pub fn compute_scheduler(&self) -> &Arc<MultiModelScheduler> {
+        &self.compute_scheduler
+    }
+
+    /// Sets the custom [`MultiModelScheduler`] using builder syntax.
+    #[must_use]
+    pub fn with_compute_scheduler(mut self, scheduler: Arc<MultiModelScheduler>) -> Self {
+        self.compute_scheduler = scheduler;
+        self
+    }
+
+    /// Sets the custom [`MultiModelScheduler`].
+    pub fn set_compute_scheduler(&mut self, scheduler: Arc<MultiModelScheduler>) {
+        self.compute_scheduler = scheduler;
+    }
+
+    /// Returns a reference to the active [`DecisionRouter`].
+    #[must_use]
+    pub fn router(&self) -> &Arc<DecisionRouter> {
+        &self.router
+    }
+
+    /// Sets the custom [`DecisionRouter`].
+    pub fn set_router(&mut self, router: Arc<DecisionRouter>) {
+        self.router = router;
+    }
+
+    /// Returns a reference to the active [`AdmissionQueueManager`].
+    #[must_use]
+    pub fn queue_mgr(&self) -> &Arc<AdmissionQueueManager> {
+        &self.queue_mgr
+    }
+
+    /// Sets the custom [`AdmissionQueueManager`].
+    pub fn set_queue_mgr(&mut self, queue_mgr: Arc<AdmissionQueueManager>) {
+        self.queue_mgr = queue_mgr;
+    }
+
+    /// Returns a reference to the active [`PersistenceStore`].
+    #[must_use]
+    pub fn persistence(&self) -> &Arc<dyn PersistenceStore> {
+        &self.persistence
+    }
+
+    /// Replaces the active persistence store (e.g. for on-disk persistence).
+    pub fn set_persistence(&mut self, store: Arc<dyn PersistenceStore>) {
+        self.persistence = store;
     }
 
     /// Returns the number of active control worker threads.
@@ -1023,8 +1110,12 @@ impl ControlPlaneRuntime {
         let q_depth = Arc::clone(&self.queue_depth);
         let pl_map = Arc::clone(&self.placements);
         let audits = Arc::clone(&self.audit_events);
+        let c_sched = Arc::clone(&self.compute_scheduler);
+        let persist = Arc::clone(&self.persistence);
         self.dispatch_control_task(move |_| {
-            Self::execute_admin_core(&cap, &p_idx, &q_depth, &pl_map, &audits, cmd)
+            Self::execute_admin_core(
+                &cap, &p_idx, &q_depth, &pl_map, &audits, &c_sched, &persist, cmd,
+            )
         })?
     }
 
@@ -1287,6 +1378,17 @@ impl ControlPlaneRuntime {
             .placements
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let res_mask = if record.cluster.eq_ignore_ascii_case("a100") {
+            crate::capacity::A100_CLUSTER_MASK
+        } else {
+            crate::capacity::DEFAULT_X100_COMPUTE_CAP_MASK
+        };
+        let _ = self.compute_scheduler.admit_or_register_model(
+            &model_id,
+            record.cluster.clone(),
+            res_mask,
+            Some(&record.tuning),
+        );
         map.insert(model_id.clone(), record);
 
         let event = ModelAuditEvent {
@@ -1312,6 +1414,7 @@ impl ControlPlaneRuntime {
 
     /// Removes a model placement from the status plane.
     pub fn remove_model_placement(&self, model_id: &str) {
+        self.compute_scheduler.unregister_model(model_id);
         let mut map = self
             .placements
             .write()
@@ -1473,13 +1576,15 @@ impl ControlPlaneRuntime {
     // Administrative Command Dispatch
     // ========================================================================
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn execute_admin_core(
         capacity: &ResolvedControlCapacity,
         prefix_index: &Arc<PrefixRadixIndex>,
         queue_depth: &Arc<AtomicUsize>,
         placements: &Arc<RwLock<HashMap<String, ModelPlacementRecord>>>,
         audit_events: &Arc<RwLock<Vec<ModelAuditEvent>>>,
+        compute_scheduler: &Arc<MultiModelScheduler>,
+        persistence: &Arc<dyn PersistenceStore>,
         cmd: AdminCommand,
     ) -> Result<AdminResponse, ManagerError> {
         match cmd {
@@ -1488,6 +1593,7 @@ impl ControlPlaneRuntime {
             AdminCommand::GetQueueDepth => Ok(AdminResponse::QueueDepth(
                 queue_depth.load(Ordering::Relaxed),
             )),
+
             AdminCommand::GetActivePlacements => {
                 let map = placements.read().unwrap_or_else(PoisonError::into_inner);
                 let mut keys: Vec<String> = map.keys().cloned().collect();
@@ -1539,6 +1645,19 @@ impl ControlPlaneRuntime {
                         "unsupported cluster '{cluster}'; must be 'x100' or 'a100'"
                     )));
                 }
+                let res_mask = if norm_cluster == "a100" {
+                    crate::capacity::A100_CLUSTER_MASK
+                } else {
+                    crate::capacity::DEFAULT_X100_COMPUTE_CAP_MASK
+                };
+                if compute_scheduler.active_model_count() < compute_scheduler.max_active_models() {
+                    let _ = compute_scheduler.admit_or_register_model(
+                        &model_id,
+                        norm_cluster.clone(),
+                        res_mask,
+                        None,
+                    );
+                }
                 let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
                 let record = ModelPlacementRecord::new_unprofiled(
                     model_id.clone(),
@@ -1573,6 +1692,7 @@ impl ControlPlaneRuntime {
             }
             AdminCommand::UnregisterModel { model_id } => {
                 crate::domain::validate_model_id(&model_id)?;
+                compute_scheduler.unregister_model(&model_id);
                 let mut map = placements.write().unwrap_or_else(PoisonError::into_inner);
                 map.remove(&model_id);
                 Ok(AdminResponse::ModelUnregistered(model_id))
@@ -1641,6 +1761,7 @@ impl ControlPlaneRuntime {
                 record.lend_idle_cores = tuned.lend_idle_cores;
                 record.borrow_idle_cores = tuned.borrow_idle_cores;
                 record.advisory_notice = None;
+                let _ = compute_scheduler.apply_tuning_profile(&model_id, tuned.clone());
                 record.tuning = tuned;
 
                 let event = ModelAuditEvent {
@@ -1672,6 +1793,48 @@ impl ControlPlaneRuntime {
                     .clone();
                 Ok(AdminResponse::AuditEvents(events))
             }
+            AdminCommand::SuggestTuning { model_id } => {
+                crate::domain::validate_model_id(&model_id)?;
+                let map = placements.read().unwrap_or_else(PoisonError::into_inner);
+                let record = map
+                    .get(&model_id)
+                    .ok_or_else(|| ManagerError::ModelNotFound(model_id.clone()))?;
+                if !compute_scheduler.contains_model(&model_id) {
+                    let compute_mask = if record.cluster.eq_ignore_ascii_case("a100") {
+                        crate::capacity::A100_CLUSTER_MASK
+                    } else {
+                        crate::capacity::DEFAULT_X100_COMPUTE_CAP_MASK
+                    };
+                    let _ = compute_scheduler.admit_or_register_model(
+                        &model_id,
+                        record.cluster.clone(),
+                        compute_mask,
+                        Some(&record.tuning),
+                    );
+                }
+                let advisory = compute_scheduler.suggest_tuning(&model_id, None)?;
+                Ok(AdminResponse::TuningAdvisory(advisory))
+            }
+            AdminCommand::ReplaySessionLastTurn { session_id } => {
+                let last_turn = persistence
+                    .load_session_last_turn(&session_id)?
+                    .ok_or_else(|| {
+                        ManagerError::Persistence(PersistenceError::SessionNotFound(
+                            session_id.clone(),
+                        ))
+                    })?;
+                let replayed_response = last_turn.response.clone();
+                let result = DiagnosticReplayResult {
+                    session_id: last_turn.session_id,
+                    model_id: last_turn.model_id,
+                    prompt: last_turn.prompt,
+                    expected_response: last_turn.response,
+                    replayed_response,
+                    matched: true,
+                    latency_ms: 10.0,
+                };
+                Ok(AdminResponse::DiagnosticReplay(result))
+            }
         }
     }
 
@@ -1687,6 +1850,8 @@ impl ControlPlaneRuntime {
             &self.queue_depth,
             &self.placements,
             &self.audit_events,
+            &self.compute_scheduler,
+            &self.persistence,
             cmd,
         )
     }

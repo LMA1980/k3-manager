@@ -244,9 +244,76 @@ impl ModelPrefixTree {
     }
 }
 
-type PrefixTreeMap = HashMap<String, HashMap<String, Arc<RwLock<ModelPrefixTree>>>>;
+/// Composite lookup key for the control-plane prefix radix index (ADR-004, ADR-035, US-15).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrefixKey {
+    /// Project identifier establishing strict tenancy isolation.
+    pub project_id: String,
+    /// Logical model identifier (e.g. "qwen2.5-7b").
+    pub model_id: String,
+    /// Build/recipe digest disambiguating model weight builds and quantizations.
+    pub model_build: String,
+    /// Prompt token sequence to match or insert (u32 token IDs).
+    pub tokens: Vec<u32>,
+}
 
-/// Concurrent control-plane prefix radix index keyed by `(project_id, model_id, token_ids)`.
+impl PrefixKey {
+    /// Creates a new [`PrefixKey`].
+    #[must_use]
+    pub fn new(
+        project_id: impl Into<String>,
+        model_id: impl Into<String>,
+        model_build: impl Into<String>,
+        tokens: impl Into<Vec<u32>>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            model_id: model_id.into(),
+            model_build: model_build.into(),
+            tokens: tokens.into(),
+        }
+    }
+
+    /// Creates a [`PrefixKey`] with a default empty build (for backward compatibility).
+    #[must_use]
+    pub fn legacy(
+        project_id: impl Into<String>,
+        model_id: impl Into<String>,
+        tokens: impl Into<Vec<u32>>,
+    ) -> Self {
+        Self::new(project_id, model_id, "", tokens)
+    }
+
+    /// Number of full 16-token blocks represented by `tokens`.
+    #[must_use]
+    pub fn full_block_count(&self) -> usize {
+        self.tokens.len() / BLOCK_SIZE_TOKENS
+    }
+}
+
+/// Scope identifier pairing a model ID and a build/recipe digest.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelBuildScope {
+    /// Model identifier.
+    pub model_id: String,
+    /// Build digest or recipe identifier.
+    pub model_build: String,
+}
+
+impl ModelBuildScope {
+    /// Creates a new [`ModelBuildScope`].
+    #[must_use]
+    pub fn new(model_id: impl Into<String>, model_build: impl Into<String>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            model_build: model_build.into(),
+        }
+    }
+}
+
+type PrefixTreeMap = HashMap<String, HashMap<ModelBuildScope, Arc<RwLock<ModelPrefixTree>>>>;
+
+/// Concurrent control-plane prefix radix index keyed by `(project_id, model_id, model_build, token_ids)`.
 #[derive(Debug, Default)]
 pub struct PrefixRadixIndex {
     trees: RwLock<PrefixTreeMap>,
@@ -262,23 +329,33 @@ impl PrefixRadixIndex {
         Self::default()
     }
 
-    /// Performs a non-blocking longest-prefix match query.
-    ///
-    /// Matches the longest sequence of complete 16-token blocks (`BLOCK_SIZE_TOKENS = 16`)
-    /// and returns both the cached block IDs and remaining uncached suffix tokens.
+    /// Performs prefix matching using a [`PrefixKey`].
     #[must_use]
-    pub fn match_longest_prefix(
+    pub fn match_prefix(&self, key: &PrefixKey) -> PrefixMatchResult {
+        self.match_longest_prefix_with_build(
+            &key.project_id,
+            &key.model_id,
+            &key.model_build,
+            &key.tokens,
+        )
+    }
+
+    /// Performs a non-blocking longest-prefix match query with explicit `model_build`.
+    #[must_use]
+    pub fn match_longest_prefix_with_build(
         &self,
         project_id: &str,
         model_id: &str,
+        model_build: &str,
         token_ids: &[u32],
     ) -> PrefixMatchResult {
         self.lookup_count.fetch_add(1, Ordering::Relaxed);
 
+        let scope = ModelBuildScope::new(model_id, model_build);
         let tree_arc = {
             let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
             map.get(project_id)
-                .and_then(|models| models.get(model_id))
+                .and_then(|models| models.get(&scope))
                 .cloned()
         };
 
@@ -302,7 +379,63 @@ impl PrefixRadixIndex {
         result
     }
 
-    /// Inserts 16-token aligned KV cache blocks into the radix index for `(project_id, model_id)`.
+    /// Performs a non-blocking longest-prefix match query defaulting `model_build` to `""`.
+    ///
+    /// Matches the longest sequence of complete 16-token blocks (`BLOCK_SIZE_TOKENS = 16`)
+    /// and returns both the cached block IDs and remaining uncached suffix tokens.
+    #[must_use]
+    pub fn match_longest_prefix(
+        &self,
+        project_id: &str,
+        model_id: &str,
+        token_ids: &[u32],
+    ) -> PrefixMatchResult {
+        self.match_longest_prefix_with_build(project_id, model_id, "", token_ids)
+    }
+
+    /// Inserts 16-token aligned KV cache blocks into the radix index using a [`PrefixKey`].
+    pub fn insert_key(&self, key: &PrefixKey, block_ids: &[u32]) -> usize {
+        self.insert_with_build(
+            &key.project_id,
+            &key.model_id,
+            &key.model_build,
+            &key.tokens,
+            block_ids,
+        )
+    }
+
+    /// Inserts 16-token aligned KV cache blocks into the radix index with explicit `model_build`.
+    pub fn insert_with_build(
+        &self,
+        project_id: &str,
+        model_id: &str,
+        model_build: &str,
+        token_ids: &[u32],
+        block_ids: &[u32],
+    ) -> usize {
+        let scope = ModelBuildScope::new(model_id, model_build);
+        let tree_arc = {
+            let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
+            map.get(project_id)
+                .and_then(|models| models.get(&scope))
+                .cloned()
+        };
+        let tree_arc = if let Some(arc) = tree_arc {
+            arc
+        } else {
+            let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
+            map.entry(project_id.to_owned())
+                .or_default()
+                .entry(scope)
+                .or_insert_with(|| Arc::new(RwLock::new(ModelPrefixTree::default())))
+                .clone()
+        };
+
+        let mut tree = tree_arc.write().unwrap_or_else(PoisonError::into_inner);
+        tree.insert(token_ids, block_ids)
+    }
+
+    /// Inserts 16-token aligned KV cache blocks into the radix index defaulting `model_build` to `""`.
     ///
     /// Returns the number of 16-token blocks successfully registered.
     pub fn insert(
@@ -312,36 +445,24 @@ impl PrefixRadixIndex {
         token_ids: &[u32],
         block_ids: &[u32],
     ) -> usize {
-        let tree_arc = {
-            let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
-            map.get(project_id)
-                .and_then(|models| models.get(model_id))
-                .cloned()
-        };
-        let tree_arc = if let Some(arc) = tree_arc {
-            arc
-        } else {
-            let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
-            map.entry(project_id.to_owned())
-                .or_default()
-                .entry(model_id.to_owned())
-                .or_insert_with(|| Arc::new(RwLock::new(ModelPrefixTree::default())))
-                .clone()
-        };
-
-        let mut tree = tree_arc.write().unwrap_or_else(PoisonError::into_inner);
-        tree.insert(token_ids, block_ids)
+        self.insert_with_build(project_id, model_id, "", token_ids, block_ids)
     }
 
-    /// Invalidates all cached prefix blocks for a specific model within a project.
+    /// Invalidates all cached prefix blocks for a specific model and build within a project.
     ///
     /// Returns the number of blocks invalidated.
-    pub fn invalidate_model(&self, project_id: &str, model_id: &str) -> usize {
+    pub fn invalidate_model_with_build(
+        &self,
+        project_id: &str,
+        model_id: &str,
+        model_build: &str,
+    ) -> usize {
+        let scope = ModelBuildScope::new(model_id, model_build);
         let removed = {
             let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
             let rem = map
                 .get_mut(project_id)
-                .and_then(|models| models.remove(model_id));
+                .and_then(|models| models.remove(&scope));
             if let Some(models) = map.get(project_id) {
                 if models.is_empty() {
                     map.remove(project_id);
@@ -358,16 +479,58 @@ impl PrefixRadixIndex {
         }
     }
 
-    /// Invalidates all cached prefix blocks for a model across all registered projects.
+    /// Invalidates all cached prefix blocks for all builds of a model within a project.
+    ///
+    /// Returns the number of blocks invalidated.
+    pub fn invalidate_model(&self, project_id: &str, model_id: &str) -> usize {
+        let removed_trees: Vec<Arc<RwLock<ModelPrefixTree>>> = {
+            let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
+            if let Some(models) = map.get_mut(project_id) {
+                let keys_to_remove: Vec<ModelBuildScope> = models
+                    .keys()
+                    .filter(|s| s.model_id == model_id)
+                    .cloned()
+                    .collect();
+                let mut list = Vec::new();
+                for k in keys_to_remove {
+                    if let Some(tree) = models.remove(&k) {
+                        list.push(tree);
+                    }
+                }
+                if models.is_empty() {
+                    map.remove(project_id);
+                }
+                list
+            } else {
+                Vec::new()
+            }
+        };
+
+        let mut total = 0;
+        for tree in removed_trees {
+            let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
+            total += guard.total_blocks;
+        }
+        total
+    }
+
+    /// Invalidates all cached prefix blocks for a model across all registered projects and builds.
     ///
     /// Returns the total number of blocks invalidated.
     pub fn invalidate_model_all_projects(&self, model_id: &str) -> usize {
         let mut map = self.trees.write().unwrap_or_else(PoisonError::into_inner);
         let mut total_invalidated = 0;
         for models in map.values_mut() {
-            if let Some(tree) = models.remove(model_id) {
-                let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
-                total_invalidated += guard.total_blocks;
+            let keys_to_remove: Vec<ModelBuildScope> = models
+                .keys()
+                .filter(|s| s.model_id == model_id)
+                .cloned()
+                .collect();
+            for k in keys_to_remove {
+                if let Some(tree) = models.remove(&k) {
+                    let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
+                    total_invalidated += guard.total_blocks;
+                }
             }
         }
         map.retain(|_, models| !models.is_empty());
@@ -395,14 +558,21 @@ impl PrefixRadixIndex {
         }
     }
 
-    /// Invalidates a specific block ID from a `(project_id, model_id)` tree.
+    /// Invalidates a specific block ID from a `(project_id, model_id, model_build)` tree.
     ///
     /// Returns `true` if the block was found and invalidated.
-    pub fn invalidate_block(&self, project_id: &str, model_id: &str, block_id: u32) -> bool {
+    pub fn invalidate_block_with_build(
+        &self,
+        project_id: &str,
+        model_id: &str,
+        model_build: &str,
+        block_id: u32,
+    ) -> bool {
+        let scope = ModelBuildScope::new(model_id, model_build);
         let tree_arc = {
             let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
             map.get(project_id)
-                .and_then(|models| models.get(model_id))
+                .and_then(|models| models.get(&scope))
                 .cloned()
         };
 
@@ -414,15 +584,74 @@ impl PrefixRadixIndex {
         }
     }
 
+    /// Invalidates a specific block ID from any build matching `(project_id, model_id)`.
+    ///
+    /// Returns `true` if the block was found and invalidated.
+    pub fn invalidate_block(&self, project_id: &str, model_id: &str, block_id: u32) -> bool {
+        let trees: Vec<Arc<RwLock<ModelPrefixTree>>> = {
+            let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
+            map.get(project_id)
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter(|(s, _)| s.model_id == model_id)
+                        .map(|(_, tree)| tree.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut any_invalidated = false;
+        for tree in trees {
+            let mut guard = tree.write().unwrap_or_else(PoisonError::into_inner);
+            if guard.invalidate_block(block_id) {
+                any_invalidated = true;
+            }
+        }
+        any_invalidated
+    }
+
+    /// Evicts up to `max_blocks` least-recently-used leaf blocks for `(project_id, model_id, model_build)`.
+    ///
+    /// Returns the physical block IDs that were evicted.
+    pub fn evict_lru_with_build(
+        &self,
+        project_id: &str,
+        model_id: &str,
+        model_build: &str,
+        max_blocks: usize,
+    ) -> Vec<u32> {
+        let scope = ModelBuildScope::new(model_id, model_build);
+        let tree_arc = {
+            let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
+            map.get(project_id)
+                .and_then(|models| models.get(&scope))
+                .cloned()
+        };
+
+        if let Some(tree) = tree_arc {
+            let mut guard = tree.write().unwrap_or_else(PoisonError::into_inner);
+            guard.evict_lru(max_blocks)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Evicts up to `max_blocks` least-recently-used leaf blocks for `(project_id, model_id)`.
     ///
     /// Returns the physical block IDs that were evicted.
     pub fn evict_lru(&self, project_id: &str, model_id: &str, max_blocks: usize) -> Vec<u32> {
+        let scope = ModelBuildScope::new(model_id, "");
         let tree_arc = {
             let map = self.trees.read().unwrap_or_else(PoisonError::into_inner);
-            map.get(project_id)
-                .and_then(|models| models.get(model_id))
-                .cloned()
+            map.get(project_id).and_then(|models| {
+                models.get(&scope).cloned().or_else(|| {
+                    models
+                        .iter()
+                        .find(|(s, _)| s.model_id == model_id)
+                        .map(|(_, tree)| tree.clone())
+                })
+            })
         };
 
         if let Some(tree) = tree_arc {
@@ -445,8 +674,8 @@ impl PrefixRadixIndex {
             if !models.is_empty() {
                 total_projects += 1;
             }
-            for (model, tree) in models {
-                models_set.insert(model.clone());
+            for (scope, tree) in models {
+                models_set.insert(scope.model_id.clone());
                 let guard = tree.read().unwrap_or_else(PoisonError::into_inner);
                 total_blocks += guard.total_blocks;
             }
@@ -638,5 +867,33 @@ mod tests {
         assert_eq!(stats.hit_count, 1);
         assert_eq!(stats.miss_count, 1);
         assert!((stats.hit_rate() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_prefix_key_model_build_isolation() {
+        let index = PrefixRadixIndex::new();
+        let b0 = generate_block_tokens(10);
+
+        let key_q4 = PrefixKey::new("proj-1", "qwen2.5-7b", "build-q4km", b0.clone());
+        let key_q8 = PrefixKey::new("proj-1", "qwen2.5-7b", "build-q80", b0.clone());
+        assert_eq!(key_q4.full_block_count(), 1);
+
+        // Insert under Q4 build
+        let inserted = index.insert_key(&key_q4, &[42]);
+        assert_eq!(inserted, 1);
+
+        // Lookup under Q4 build: Hit block 42
+        let match_q4 = index.match_prefix(&key_q4);
+        assert_eq!(match_q4.matched_blocks, vec![42]);
+        assert_eq!(match_q4.matched_token_count, 16);
+
+        // Lookup under Q8 build: Miss (must not leak between builds)
+        let match_q8 = index.match_prefix(&key_q8);
+        assert!(match_q8.is_empty());
+
+        // Invalidate Q4 build specifically
+        let removed = index.invalidate_model_with_build("proj-1", "qwen2.5-7b", "build-q4km");
+        assert_eq!(removed, 1);
+        assert!(index.match_prefix(&key_q4).is_empty());
     }
 }

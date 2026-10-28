@@ -344,13 +344,22 @@ fn test_scenario2_runaway_workload_recovery_e2e() {
     // ------------------------------------------------------------------------
     // Step 6: Verify Structured Audit Events
     // ------------------------------------------------------------------------
-    let all_events = health_supervisor.audit_events();
-    let has_worker_event = all_events
-        .iter()
-        .any(|e| matches!(e.target, RecoveryTarget::ComputeWorker { .. }));
-    let has_task_event = all_events
-        .iter()
-        .any(|e| matches!(e.target, RecoveryTarget::ControlTask { .. }));
+    let event_deadline = Instant::now() + Duration::from_millis(1000);
+    let mut has_worker_event = false;
+    let mut has_task_event = false;
+    while Instant::now() < event_deadline {
+        let all_events = health_supervisor.audit_events();
+        has_worker_event = all_events
+            .iter()
+            .any(|e| matches!(e.target, RecoveryTarget::ComputeWorker { .. }));
+        has_task_event = all_events
+            .iter()
+            .any(|e| matches!(e.target, RecoveryTarget::ControlTask { .. }));
+        if has_worker_event && has_task_event {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     assert!(
         has_worker_event,

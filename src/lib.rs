@@ -10,9 +10,14 @@ pub mod dispatch;
 pub mod domain;
 pub mod error;
 pub mod health;
+pub mod persistence;
 pub mod prefix;
 pub mod prompt;
+pub mod queue;
+pub mod router;
 pub mod runtime;
+pub mod scheduler;
+pub mod session;
 pub mod supervisor;
 
 pub use capacity::{
@@ -44,8 +49,13 @@ pub use k3_core::profile::{
     ModelListResponse, ModelLoadAuditEvent, ModelProfile, PriorityClass, ProfileStatus,
     TuningProfile,
 };
+pub use persistence::{
+    DiagnosticReplayResult, DuckDbPersistenceStore, OptionalExt, OptionalExtension,
+    PersistenceError, PersistenceStore, Project, SessionLastTurn, SqlitePersistenceStore, Tenant,
+};
 pub use prefix::{
-    BLOCK_SIZE_TOKENS, BlockTokens, PrefixCacheStats, PrefixMatchResult, PrefixRadixIndex,
+    BLOCK_SIZE_TOKENS, BlockTokens, ModelBuildScope, PrefixCacheStats, PrefixKey,
+    PrefixMatchResult, PrefixRadixIndex,
 };
 pub use prompt::{
     ChatTemplate, DetokenizeStep, GgufTokenizer, IncrementalStopDetector, PreparedPrompt,
@@ -53,12 +63,30 @@ pub use prompt::{
     StreamingDetokenizer, TokenType, Tokenizer, evaluate_stop_token, format_chat_prompt,
     validate_and_tokenize,
 };
+pub use queue::{
+    AdmissionQueueConfig, AdmissionQueueManager, DEFAULT_ESTIMATED_PASS_LATENCY_MS,
+    DEFAULT_KEEP_ALIVE_INTERVAL, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_MIN_RETRY_AFTER_SECS,
+    DEFAULT_PASSES_PER_REQUEST, ModelAdmissionQueue, QueueMetrics, QueuePermit, QueueSseFrame,
+    QueuedRequest,
+};
+pub use router::{
+    DecisionRouter, ExecutionAssessment, ModelCapability, ModelTarget, RouterConfig,
+    RoutingDecision, RoutingRequest, StructuralConstraint,
+};
 pub use runtime::{
     ActiveTaskRecord, AdminCommand, AdminResponse, ControlPlaneRuntime, DEFAULT_CONTROL_TASK_LEASE,
     ModelAuditEvent, ModelAuditEventType, ModelPlacementRecord, TaskLeaseSnapshot,
     WorkerHealthSnapshot,
 };
+pub use scheduler::{
+    DEFAULT_MAX_ACTIVE_MODELS, ModelExecutionMetrics, ModelSchedulerEntry, ModelSchedulingState,
+    MultiModelScheduler, ScheduledPass,
+};
+pub use session::{
+    DEFAULT_BROADCAST_CAPACITY, DEFAULT_RETENTION_WINDOW, SessionError, SessionRegistry,
+    SessionState,
+};
 pub use supervisor::{
-    DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_PASS_TIMEOUT, ManagedWorker, WorkerPlacement,
-    WorkerSupervisor, find_worker_binary,
+    DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_PASS_TIMEOUT, ManagedWorker, ResumptionSnapshot,
+    WorkerPlacement, WorkerSupervisor, find_worker_binary,
 };
