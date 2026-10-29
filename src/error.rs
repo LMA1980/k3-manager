@@ -51,6 +51,34 @@ pub enum ManagerError {
     },
     /// Model identifier was not found in registry.
     ModelNotFound(String),
+    /// Active model concurrency limit exceeded (ADR-043, US-09 Scenario 3).
+    ConcurrencyLimitExceeded {
+        /// Current number of active loaded models.
+        active: usize,
+        /// Maximum allowed active models.
+        max: usize,
+    },
+    /// Client-supplied priority override rejected (ADR-014, US-10 Scenario 3).
+    PriorityOverrideRejected {
+        /// Logical model identifier.
+        model_id: String,
+    },
+    /// Resumption requested before prefill was fully committed in shared memory (US-16).
+    IncompletePrefillResumptionNotSupported {
+        /// Committed token count in arena metadata.
+        committed_tokens: u32,
+        /// Full prompt length.
+        prompt_len: u32,
+    },
+    /// Automatic decision routing unavailable (US-12).
+    RoutingUnavailable {
+        /// Diagnostic explanation of the routing failure.
+        reason: String,
+    },
+    /// Admission queue saturated or estimated wait exceeded (US-13).
+    QueueSaturated(K3Error),
+    /// Operational metadata or session persistence failure (US-17).
+    Persistence(crate::persistence::PersistenceError),
     /// General I/O failure.
     Io(io::Error),
 }
@@ -89,6 +117,35 @@ impl fmt::Display for ManagerError {
                 write!(f, "[k3-manager status {status:?}] {message}")
             }
             Self::ModelNotFound(id) => write!(f, "[k3-manager model not found] '{id}'"),
+            Self::ConcurrencyLimitExceeded { active, max } => {
+                write!(
+                    f,
+                    "[k3-manager concurrency limit exceeded] active models ({active}) reached maximum limit ({max})"
+                )
+            }
+            Self::PriorityOverrideRejected { model_id } => {
+                write!(
+                    f,
+                    "[k3-manager priority override rejected] client priority override rejected for model '{model_id}'; operator tuning profile is authoritative"
+                )
+            }
+            Self::IncompletePrefillResumptionNotSupported {
+                committed_tokens,
+                prompt_len,
+            } => {
+                write!(
+                    f,
+                    "[k3-manager resumption error] incomplete prefill resumption not supported (committed: {committed_tokens}, prompt_len: {prompt_len})"
+                )
+            }
+            Self::RoutingUnavailable { reason } => {
+                write!(
+                    f,
+                    "[k3-manager routing unavailable] routing unavailable: {reason}"
+                )
+            }
+            Self::QueueSaturated(e) => write!(f, "[k3-manager queue saturated] {e}"),
+            Self::Persistence(e) => write!(f, "[k3-manager persistence error] {e}"),
             Self::Io(e) => write!(f, "[k3-manager io error] {e}"),
         }
     }
@@ -98,7 +155,8 @@ impl std::error::Error for ManagerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Shm(e) => Some(e),
-            Self::Affinity(e) | Self::TensorBounds(e) => Some(e),
+            Self::Affinity(e) | Self::TensorBounds(e) | Self::QueueSaturated(e) => Some(e),
+            Self::Persistence(e) => Some(e),
             Self::Io(e) => Some(e),
             _ => None,
         }
@@ -121,8 +179,16 @@ impl From<K3Error> for ManagerError {
     fn from(err: K3Error) -> Self {
         match err {
             e @ K3Error::AffinityError { .. } => Self::Affinity(e),
+            K3Error::RoutingUnavailable { reason } => Self::RoutingUnavailable { reason },
+            e @ K3Error::QueueSaturated { .. } => Self::QueueSaturated(e),
             other => Self::TensorBounds(other),
         }
+    }
+}
+
+impl From<crate::persistence::PersistenceError> for ManagerError {
+    fn from(err: crate::persistence::PersistenceError) -> Self {
+        Self::Persistence(err)
     }
 }
 
@@ -204,5 +270,23 @@ mod tests {
         assert!(disp.contains("qwen2.5-7b"));
         assert!(disp.contains("1234"));
         assert!(disp.contains("250ms"));
+    }
+
+    #[test]
+    fn test_concurrency_limit_exceeded_display() {
+        let err = ManagerError::ConcurrencyLimitExceeded { active: 3, max: 3 };
+        let disp = format!("{err}");
+        assert!(disp.contains("[k3-manager concurrency limit exceeded]"));
+        assert!(disp.contains("active models (3) reached maximum limit (3)"));
+    }
+
+    #[test]
+    fn test_priority_override_rejected_display() {
+        let err = ManagerError::PriorityOverrideRejected {
+            model_id: "batch-gen".to_string(),
+        };
+        let disp = format!("{err}");
+        assert!(disp.contains("[k3-manager priority override rejected]"));
+        assert!(disp.contains("batch-gen"));
     }
 }

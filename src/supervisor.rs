@@ -829,6 +829,79 @@ impl ManagedWorker {
     pub fn mark_volatile_block(&mut self, block_idx: usize) -> Result<(), ManagerError> {
         self.set_block_tag(block_idx, KvBlockTag::Volatile)
     }
+
+    /// Inspects the surviving arena metadata across `block_indices` to reconstruct resumption state (ADR-026, US-16).
+    ///
+    /// # Errors
+    /// Returns [`ManagerError`] on bounds check failure.
+    pub fn inspect_resumption_state(
+        &self,
+        block_indices: &[u32],
+        prompt_len: u32,
+    ) -> Result<ResumptionSnapshot, ManagerError> {
+        let mut total_committed: u32 = 0;
+        let mut last_rng_state = [42_u64, 0, 0, 0];
+
+        for &b_idx in block_indices {
+            let meta = self.arena.block_meta(b_idx as usize)?;
+            total_committed += meta.committed_token_count;
+            if meta.committed_token_count > 0 && !meta.sampler_rng_state.iter().all(|&x| x == 0) {
+                last_rng_state = meta.sampler_rng_state;
+            }
+        }
+
+        let skip_prefill = total_committed >= prompt_len && total_committed > 0;
+        let next_decode_pos = total_committed;
+
+        Ok(ResumptionSnapshot {
+            total_committed_tokens: total_committed,
+            skip_prefill,
+            next_decode_pos,
+            sampler_rng_state: last_rng_state,
+        })
+    }
+
+    /// Resumes autoregressive decode loop starting from `committed_token_count` without re-running prefill.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError`] on failure.
+    pub fn resume_decode(
+        &mut self,
+        request_id: u64,
+        sequence_id: u64,
+        prompt_len: u32,
+        block_indices: &[u32],
+        last_token: u32,
+    ) -> Result<ForwardPassResult, ManagerError> {
+        let snapshot = self.inspect_resumption_state(block_indices, prompt_len)?;
+        if !snapshot.skip_prefill {
+            return Err(ManagerError::IncompletePrefillResumptionNotSupported {
+                committed_tokens: snapshot.total_committed_tokens,
+                prompt_len,
+            });
+        }
+        let req = ForwardPassRequest::new_decode(
+            request_id,
+            sequence_id,
+            last_token,
+            snapshot.next_decode_pos,
+            block_indices.to_vec(),
+        );
+        self.execute_forward_pass(&req)
+    }
+}
+
+/// Resumption snapshot describing context state recovered from surviving shared memory arena (ADR-026, ADR-042, US-16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumptionSnapshot {
+    /// Total number of committed tokens across all active blocks.
+    pub total_committed_tokens: u32,
+    /// Whether prompt prefill has already been fully committed in the arena.
+    pub skip_prefill: bool,
+    /// Next sequence position to decode.
+    pub next_decode_pos: u32,
+    /// Recovered deterministic sampler PRNG state.
+    pub sampler_rng_state: [u64; 4],
 }
 
 impl Drop for ManagedWorker {
@@ -1022,6 +1095,9 @@ fn spawn_and_attach_process(
     Ok((child, stream))
 }
 
+/// Default maximum number of simultaneously active models loaded in memory (ADR-043).
+pub const DEFAULT_MAX_ACTIVE_MODELS: usize = 3;
+
 /// Control-plane supervisor managing isolated compute workers and orchestrating recovery.
 #[derive(Debug)]
 pub struct WorkerSupervisor {
@@ -1030,6 +1106,7 @@ pub struct WorkerSupervisor {
     capacity: ResolvedControlCapacity,
     default_heartbeat_timeout: Duration,
     default_pass_timeout: Duration,
+    max_active_models: usize,
 }
 
 impl Default for WorkerSupervisor {
@@ -1053,7 +1130,26 @@ impl WorkerSupervisor {
             capacity,
             default_heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
             default_pass_timeout: DEFAULT_PASS_TIMEOUT,
+            max_active_models: DEFAULT_MAX_ACTIVE_MODELS,
         }
+    }
+
+    /// Returns the maximum allowed active models loaded concurrently.
+    #[must_use]
+    pub const fn max_active_models(&self) -> usize {
+        self.max_active_models
+    }
+
+    /// Sets the maximum allowed active models loaded concurrently.
+    pub fn set_max_active_models(&mut self, max: usize) {
+        self.max_active_models = max;
+    }
+
+    /// Sets the maximum allowed active models loaded concurrently using builder syntax.
+    #[must_use]
+    pub const fn with_max_active_models(mut self, max: usize) -> Self {
+        self.max_active_models = max;
+        self
     }
 
     /// Sets the custom [`IsolationDomainController`] for compute worker and control domain placement.
@@ -1201,6 +1297,15 @@ impl WorkerSupervisor {
         validate_model_id(&placement.model_id)?;
         self.capacity.validate_worker_placement(&placement)?;
         let compute_mask = resolve_worker_compute_mask(&placement)?;
+
+        // Enforce max_active_models concurrency cap at load time (ADR-043, US-09 Scenario 3)
+        let is_existing = self.workers.contains_key(&placement.model_id);
+        if !is_existing && self.workers.len() >= self.max_active_models {
+            return Err(ManagerError::ConcurrencyLimitExceeded {
+                active: self.workers.len(),
+                max: self.max_active_models,
+            });
+        }
 
         // Enforce unprofiled conservative defaults and operator tuning invariants (US-07 Scenario 1, ADR-028, ADR-030, ADR-031)
         let is_unprofiled = placement.tuning.as_ref().is_none_or(|t| t.unprofiled);
@@ -1414,6 +1519,85 @@ impl WorkerSupervisor {
         worker.has_timed_out = false;
 
         Ok(self.workers.get_mut(model_id).expect("worker exists"))
+    }
+
+    /// Recovers a supervised test worker by attaching a replacement mock socket stream,
+    /// incrementing generation count, and restoring active state, while preserving the surviving arena.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError::ModelNotFound`] if no worker is registered for `model_id`.
+    pub fn recover_test_worker(
+        &mut self,
+        model_id: &str,
+        stream: UnixStream,
+    ) -> Result<&mut ManagedWorker, ManagerError> {
+        let worker = self
+            .workers
+            .get_mut(model_id)
+            .ok_or_else(|| ManagerError::ModelNotFound(model_id.to_owned()))?;
+        worker.stream = Some(stream);
+        worker.generation += 1;
+        worker.is_alive = true;
+        worker.active_pass_start = None;
+        worker.has_timed_out = false;
+        Ok(worker)
+    }
+
+    /// Checks if a worker process has terminated or crashed.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError::ModelNotFound`] if no worker is registered for `model_id`.
+    pub fn is_worker_crashed(&mut self, model_id: &str) -> Result<bool, ManagerError> {
+        let worker = self
+            .workers
+            .get_mut(model_id)
+            .ok_or_else(|| ManagerError::ModelNotFound(model_id.to_owned()))?;
+        Ok(!worker.is_alive())
+    }
+
+    /// Inspects the surviving arena metadata for a registered model across `block_indices` (US-16).
+    ///
+    /// # Errors
+    /// Returns [`ManagerError`] on failure.
+    pub fn inspect_resumption_state(
+        &self,
+        model_id: &str,
+        block_indices: &[u32],
+        prompt_len: u32,
+    ) -> Result<ResumptionSnapshot, ManagerError> {
+        let worker = self
+            .workers
+            .get(model_id)
+            .ok_or_else(|| ManagerError::ModelNotFound(model_id.to_owned()))?;
+        worker.inspect_resumption_state(block_indices, prompt_len)
+    }
+
+    /// Resumes autoregressive decode execution on a recovered worker starting from `committed_token_count`.
+    ///
+    /// Skips prefill computation completely if prompt tokens were already committed in the surviving arena.
+    ///
+    /// # Errors
+    /// Returns [`ManagerError`] on failure.
+    pub fn resume_decode(
+        &mut self,
+        model_id: &str,
+        request_id: u64,
+        sequence_id: u64,
+        prompt_len: u32,
+        block_indices: &[u32],
+        last_token: u32,
+    ) -> Result<ForwardPassResult, ManagerError> {
+        let worker = self
+            .workers
+            .get_mut(model_id)
+            .ok_or_else(|| ManagerError::ModelNotFound(model_id.to_owned()))?;
+        worker.resume_decode(
+            request_id,
+            sequence_id,
+            prompt_len,
+            block_indices,
+            last_token,
+        )
     }
 
     /// Shuts down and unregisters all supervised workers cleanly.

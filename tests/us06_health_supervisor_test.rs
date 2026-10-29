@@ -292,14 +292,21 @@ fn test_sub_issue_76_runaway_control_task_lease_preemption_and_thread_replacemen
         .expect("tokenization must immediately succeed after worker thread replacement");
     assert_eq!(post_recovery_tokens, vec![1]);
 
-    // 3. Verify audit events recorded
-    let events = health_supervisor.audit_events();
-    assert!(
-        events
+    // 3. Verify audit events recorded (with bounded polling for watchdog thread commit)
+    let start_wait = std::time::Instant::now();
+    let mut found = false;
+    while start_wait.elapsed() < Duration::from_millis(500) {
+        if health_supervisor
+            .audit_events()
             .iter()
-            .any(|e| matches!(e.target, RecoveryTarget::ControlTask { .. })),
-        "audit event must record control task preemption"
-    );
+            .any(|e| matches!(e.target, RecoveryTarget::ControlTask { .. }))
+        {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(found, "audit event must record control task preemption");
 
     health_supervisor.stop_watchdog();
 }

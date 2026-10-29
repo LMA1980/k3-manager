@@ -29,6 +29,8 @@ tokio = { version = "1.54.1", features = ["process", "rt", "net", "io-util", "sy
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 zerocopy = { version = "0.8.63", features = ["derive"] }
+duckdb = { version = "=1.2.2", default-features = false }
+
 
 [dev-dependencies]
 k3-kv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kv.git" }
