@@ -9,16 +9,50 @@ pub mod client;
 pub mod dispatch;
 pub mod domain;
 pub mod error;
+pub mod flight;
 pub mod health;
+pub mod ingestion;
 pub mod persistence;
 pub mod prefix;
 pub mod prompt;
+pub mod protocol;
 pub mod queue;
 pub mod router;
 pub mod runtime;
 pub mod scheduler;
 pub mod session;
+pub mod store;
 pub mod supervisor;
+
+pub use flight::{
+    BOUNDED_MEMLOCK_CEILING_BYTES, FlightError, FlightReceiver, FlightStream, FlightSummary,
+    FlightTensorBatchStreamer, IME_TILE_ELEMENTS, MemfdArena, TYPE_ID_FLIGHT_ARENA,
+    flight_tensor_schema,
+};
+pub use ingestion::{
+    AuthStatus, GgufHeaderPrefix, HuggingFaceAdapter, IngestionError, LocalFileAdapter, ModelFormat,
+    ModelRevision, ModelVersionListing, OllamaAdapter, PullArtifactSummary, PullProgress,
+    PullRequest, RemoteModelSummary, SafeTensorsHeaderPrefix, SearchFilter, SourceAdapter,
+    SourceAdapterRegistry, SourceCredentials, StagingDownload, StagingPipeline,
+};
+
+pub use store::{
+    AlignedPromptEnvironment, BlobUsageInfo, CandidateSuitability, CapabilityFilter,
+    ContentAddressedStore, DEFAULT_STORE_ROOT, DerivedBlobManager, DerivedResolution,
+    ENV_STORE_ROOT, GcReport, HighWaterMarkWarning, MAX_PATH_COMPONENT_LEN, MockProcMapsScanner,
+    ModelManifest, ProcessMappingInfo, ProcessMapsScanner, RealProcMapsScanner, RecipeDescriptor,
+    ResolvedAlias, RetentionPolicy, Sha256, StaleRecipeOutcome, StorageGarbageCollector,
+    check_derived_memory_admission, hex_encode, parse_alias_id, validate_path_component,
+};
+
+pub use protocol::{
+    ClaudeAdapter, ClaudeContent, ClaudeContentBlock, ClaudeErrorDetails, ClaudeErrorResponse,
+    ClaudeMessage, ClaudeMessageRequest, ClaudeMessageResponse, ClaudeSystem, ClaudeThinkingConfig,
+    ClaudeTool, ClaudeUsage, OpenAiAdapter, OpenAiChatRequest, OpenAiChatResponse, OpenAiChoice,
+    OpenAiChunkChoice, OpenAiChunkDelta, OpenAiChunkResponse, OpenAiErrorDetails,
+    OpenAiErrorResponse, OpenAiFunction, OpenAiFunctionCall, OpenAiMessage, OpenAiResponseMessage,
+    OpenAiStop, OpenAiTool, OpenAiToolCall, OpenAiUsage, ProtocolServer, ProtocolServerConfig,
+};
 
 pub use capacity::{
     A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, ActiveControlRotator,
@@ -50,8 +84,10 @@ pub use k3_core::profile::{
     TuningProfile,
 };
 pub use persistence::{
-    DiagnosticReplayResult, DuckDbPersistenceStore, OptionalExt, OptionalExtension,
-    PersistenceError, PersistenceStore, Project, SessionLastTurn, SqlitePersistenceStore, Tenant,
+    BlobReferenceRecord, CasCatalog, DerivedBlobRecord, DiagnosticReplayResult,
+    DuckDbPersistenceStore, ModelAliasRecord, ModelBlobRecord, ModelManifestRecord, OptionalExt,
+    OptionalExtension, PersistenceError, PersistenceStore, Project, SessionLastTurn,
+    SqlitePersistenceStore, Tenant,
 };
 pub use prefix::{
     BLOCK_SIZE_TOKENS, BlockTokens, ModelBuildScope, PrefixCacheStats, PrefixKey,
