@@ -53,6 +53,20 @@ fn current_timestamp_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+fn push_audit_event_monotonic(
+    audit_events: &RwLock<Vec<ModelAuditEvent>>,
+    mut event: ModelAuditEvent,
+) {
+    let mut guard = audit_events.write().unwrap_or_else(PoisonError::into_inner);
+    let now = current_timestamp_ms();
+    if let Some(last) = guard.last() {
+        event.timestamp_ms = now.max(last.timestamp_ms);
+    } else {
+        event.timestamp_ms = now;
+    }
+    guard.push(event);
+}
+
 /// Health and status snapshot of a managed compute worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerHealthSnapshot {
@@ -1406,10 +1420,7 @@ impl ControlPlaneRuntime {
                 entry.unprofiled
             ),
         };
-        self.audit_events
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(event);
+        push_audit_event_monotonic(&self.audit_events, event);
     }
 
     /// Removes a model placement from the status plane.
@@ -1531,10 +1542,7 @@ impl ControlPlaneRuntime {
                 entry.unprofiled
             ),
         };
-        self.audit_events
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(event);
+        push_audit_event_monotonic(&self.audit_events, event);
 
         Some(entry)
     }
@@ -1683,10 +1691,7 @@ impl ControlPlaneRuntime {
                         entry.unprofiled
                     ),
                 };
-                audit_events
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(event);
+                push_audit_event_monotonic(audit_events, event);
 
                 Ok(AdminResponse::ModelRegistered(model_id))
             }
@@ -1721,10 +1726,7 @@ impl ControlPlaneRuntime {
                         entry.unprofiled
                     ),
                 };
-                audit_events
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(event);
+                push_audit_event_monotonic(audit_events, event);
 
                 Ok(AdminResponse::ModelStatus(entry))
             }
@@ -1779,10 +1781,7 @@ impl ControlPlaneRuntime {
                         record.cluster, record.n_ctx, record.priority_class
                     ),
                 };
-                audit_events
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(event);
+                push_audit_event_monotonic(audit_events, event);
 
                 Ok(AdminResponse::TuningProfileApplied(model_id))
             }
