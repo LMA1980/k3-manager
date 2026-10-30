@@ -193,7 +193,8 @@ impl FlightReceiver {
                 ) {
                     let rows = offsets.len().min(weights.len());
                     for i in 0..rows {
-                        let extent = (offsets.value(i) as usize).saturating_add(weights.value(i).len());
+                        let extent =
+                            (offsets.value(i) as usize).saturating_add(weights.value(i).len());
                         if extent > max_extent {
                             max_extent = extent;
                         }

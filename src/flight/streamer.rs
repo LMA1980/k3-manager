@@ -159,7 +159,9 @@ impl FlightTensorBatchStreamer {
         target_endpoint: &str,
     ) -> Result<FlightSummary, FlightError> {
         if target_endpoint.is_empty() {
-            return Err(FlightError::TransportError("empty target endpoint".to_owned()));
+            return Err(FlightError::TransportError(
+                "empty target endpoint".to_owned(),
+            ));
         }
 
         let start = Instant::now();
@@ -178,7 +180,9 @@ impl FlightTensorBatchStreamer {
                 .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| FlightError::InvalidBatch("missing tensor_name column".to_owned()))?;
+                .ok_or_else(|| {
+                    FlightError::InvalidBatch("missing tensor_name column".to_owned())
+                })?;
 
             for i in 0..names.len() {
                 tensor_names.insert(names.value(i).to_owned());

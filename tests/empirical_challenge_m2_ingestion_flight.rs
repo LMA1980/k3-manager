@@ -40,8 +40,8 @@ use k3_manager::flight::{
     FlightError, FlightReceiver, FlightStream, FlightTensorBatchStreamer, MemfdArena,
 };
 use k3_manager::ingestion::{
-    GgufHeaderPrefix, HuggingFaceAdapter, ModelFormat, PullRequest,
-    SafeTensorsHeaderPrefix, SourceAdapter, SourceCredentials, StagingPipeline,
+    GgufHeaderPrefix, HuggingFaceAdapter, ModelFormat, PullRequest, SafeTensorsHeaderPrefix,
+    SourceAdapter, SourceCredentials, StagingPipeline,
 };
 
 static CHALLENGE_SEQ: AtomicU64 = AtomicU64::new(8000);
@@ -104,7 +104,11 @@ fn challenge_staging_corrupted_gguf_headers_cleaned_up() {
     let res1 = StagingPipeline::verify_format_header(&part1, &ModelFormat::Gguf);
     assert!(res1.is_err(), "bad GGUF magic must fail verification");
     assert!(!part1.exists(), "part file must be unlinked on bad magic");
-    assert_eq!(store.count_staging_files(), 0, "staging dir must have 0 leaks");
+    assert_eq!(
+        store.count_staging_files(),
+        0,
+        "staging dir must have 0 leaks"
+    );
 
     // Subcase 2: Truncated GGUF (fewer than 24 bytes header)
     let truncated_payload = b"GGUF\x03\x00\x00\x00"; // only 8 bytes
@@ -113,9 +117,16 @@ fn challenge_staging_corrupted_gguf_headers_cleaned_up() {
     drop(f2);
 
     let res2 = StagingPipeline::verify_format_header(&part2, &ModelFormat::Gguf);
-    assert!(res2.is_err(), "truncated GGUF header must fail verification");
+    assert!(
+        res2.is_err(),
+        "truncated GGUF header must fail verification"
+    );
     assert!(!part2.exists(), "part file must be unlinked on truncation");
-    assert_eq!(store.count_staging_files(), 0, "staging dir must have 0 leaks");
+    assert_eq!(
+        store.count_staging_files(),
+        0,
+        "staging dir must have 0 leaks"
+    );
 
     // Subcase 3: Unsupported future version (e.g. version 99)
     let header_v99 = GgufHeaderPrefix {
@@ -125,13 +136,21 @@ fn challenge_staging_corrupted_gguf_headers_cleaned_up() {
         metadata_kv_count: 2,
     };
     let (part3, mut f3) = StagingPipeline::create_staging_file(&pipeline.staging_dir()).unwrap();
-    f3.write_all(zerocopy::IntoBytes::as_bytes(&header_v99)).unwrap();
+    f3.write_all(zerocopy::IntoBytes::as_bytes(&header_v99))
+        .unwrap();
     drop(f3);
 
     let res3 = StagingPipeline::verify_format_header(&part3, &ModelFormat::Gguf);
     assert!(res3.is_err(), "unsupported GGUF version must fail");
-    assert!(!part3.exists(), "part file must be unlinked on unsupported version");
-    assert_eq!(store.count_staging_files(), 0, "staging dir must have 0 leaks");
+    assert!(
+        !part3.exists(),
+        "part file must be unlinked on unsupported version"
+    );
+    assert_eq!(
+        store.count_staging_files(),
+        0,
+        "staging dir must have 0 leaks"
+    );
 }
 
 #[test]
@@ -142,38 +161,56 @@ fn challenge_staging_corrupted_safetensors_headers_cleaned_up() {
     // Subcase 1: 0-byte SafeTensors header length
     let header_zero = SafeTensorsHeaderPrefix { header_len: 0 };
     let (part1, mut f1) = StagingPipeline::create_staging_file(&pipeline.staging_dir()).unwrap();
-    f1.write_all(zerocopy::IntoBytes::as_bytes(&header_zero)).unwrap();
+    f1.write_all(zerocopy::IntoBytes::as_bytes(&header_zero))
+        .unwrap();
     drop(f1);
 
     let res1 = StagingPipeline::verify_format_header(&part1, &ModelFormat::SafeTensors);
     assert!(res1.is_err(), "0-byte SafeTensors header length must fail");
     assert!(!part1.exists(), "part file must be unlinked");
-    assert_eq!(store.count_staging_files(), 0, "staging dir must have 0 leaks");
+    assert_eq!(
+        store.count_staging_files(),
+        0,
+        "staging dir must have 0 leaks"
+    );
 
     // Subcase 2: Excessive header length exceeding 100MB bound
     let header_huge = SafeTensorsHeaderPrefix {
         header_len: 200 * 1024 * 1024,
     };
     let (part2, mut f2) = StagingPipeline::create_staging_file(&pipeline.staging_dir()).unwrap();
-    f2.write_all(zerocopy::IntoBytes::as_bytes(&header_huge)).unwrap();
+    f2.write_all(zerocopy::IntoBytes::as_bytes(&header_huge))
+        .unwrap();
     drop(f2);
 
     let res2 = StagingPipeline::verify_format_header(&part2, &ModelFormat::SafeTensors);
     assert!(res2.is_err(), "header length > 100MB must be rejected");
     assert!(!part2.exists(), "part file must be unlinked");
-    assert_eq!(store.count_staging_files(), 0, "staging dir must have 0 leaks");
+    assert_eq!(
+        store.count_staging_files(),
+        0,
+        "staging dir must have 0 leaks"
+    );
 
     // Subcase 3: Header length claims 1000 bytes, but file only has 50 bytes (Truncation)
     let header_trunc = SafeTensorsHeaderPrefix { header_len: 1000 };
     let (part3, mut f3) = StagingPipeline::create_staging_file(&pipeline.staging_dir()).unwrap();
-    f3.write_all(zerocopy::IntoBytes::as_bytes(&header_trunc)).unwrap();
+    f3.write_all(zerocopy::IntoBytes::as_bytes(&header_trunc))
+        .unwrap();
     f3.write_all(b"{\"incomplete\":").unwrap();
     drop(f3);
 
     let res3 = StagingPipeline::verify_format_header(&part3, &ModelFormat::SafeTensors);
-    assert!(res3.is_err(), "file smaller than claimed header length must fail");
+    assert!(
+        res3.is_err(),
+        "file smaller than claimed header length must fail"
+    );
     assert!(!part3.exists(), "part file must be unlinked on truncation");
-    assert_eq!(store.count_staging_files(), 0, "staging dir must have 0 leaks");
+    assert_eq!(
+        store.count_staging_files(),
+        0,
+        "staging dir must have 0 leaks"
+    );
 
     // Subcase 4: Invalid JSON metadata
     let bad_json = b"not_valid_json_at_all!{[]";
@@ -181,14 +218,25 @@ fn challenge_staging_corrupted_safetensors_headers_cleaned_up() {
         header_len: bad_json.len() as u64,
     };
     let (part4, mut f4) = StagingPipeline::create_staging_file(&pipeline.staging_dir()).unwrap();
-    f4.write_all(zerocopy::IntoBytes::as_bytes(&header_bad_json)).unwrap();
+    f4.write_all(zerocopy::IntoBytes::as_bytes(&header_bad_json))
+        .unwrap();
     f4.write_all(bad_json).unwrap();
     drop(f4);
 
     let res4 = StagingPipeline::verify_format_header(&part4, &ModelFormat::SafeTensors);
-    assert!(res4.is_err(), "invalid JSON must fail SafeTensors verification");
-    assert!(!part4.exists(), "part file must be unlinked on invalid JSON");
-    assert_eq!(store.count_staging_files(), 0, "staging dir must have 0 leaks");
+    assert!(
+        res4.is_err(),
+        "invalid JSON must fail SafeTensors verification"
+    );
+    assert!(
+        !part4.exists(),
+        "part file must be unlinked on invalid JSON"
+    );
+    assert_eq!(
+        store.count_staging_files(),
+        0,
+        "staging dir must have 0 leaks"
+    );
 }
 
 #[test]
@@ -201,7 +249,8 @@ fn challenge_staging_digest_mismatch_and_interruption_no_leaks() {
     let mut data = Cursor::new(b"SOME_DATA_TO_STREAM");
     let wrong_digest = "1111111111111111111111111111111111111111111111111111111111111111";
 
-    let res1 = StagingPipeline::stream_to_staging(&part1, &mut data, Some(wrong_digest), None, None);
+    let res1 =
+        StagingPipeline::stream_to_staging(&part1, &mut data, Some(wrong_digest), None, None);
     assert!(res1.is_err());
     assert!(!part1.exists(), "part1 must be deleted on digest mismatch");
     assert_eq!(store.count_staging_files(), 0, "no staging files leaked");
@@ -236,7 +285,12 @@ fn challenge_staging_path_traversal_check() {
     let malicious_tag = "../../escaped_model_part";
     let staging_dir = store.staging_dir();
 
-    let res = adapter.pull_to_staging("huggingface", "Qwen/Qwen2.5-7B", malicious_tag, &staging_dir);
+    let res = adapter.pull_to_staging(
+        "huggingface",
+        "Qwen/Qwen2.5-7B",
+        malicious_tag,
+        &staging_dir,
+    );
     println!("pull_to_staging with path traversal tag: {res:?}");
 
     // Check if any file escaped outside staging_dir
@@ -257,27 +311,51 @@ fn challenge_flight_unaligned_tensor_sizes_rejected() {
 
     // 0 bytes -> rejected
     let empty_weights: Vec<i8> = vec![];
-    assert!(streamer.build_repacked_batch("tensor_0", 0, 0, &empty_weights).is_err());
+    assert!(
+        streamer
+            .build_repacked_batch("tensor_0", 0, 0, &empty_weights)
+            .is_err()
+    );
 
     // 1 byte -> rejected
     let one_byte = vec![42i8; 1];
-    assert!(streamer.build_repacked_batch("tensor_1", 0, 0, &one_byte).is_err());
+    assert!(
+        streamer
+            .build_repacked_batch("tensor_1", 0, 0, &one_byte)
+            .is_err()
+    );
 
     // 127 bytes -> rejected
     let w127 = vec![1i8; 127];
-    assert!(streamer.build_repacked_batch("tensor_127", 0, 0, &w127).is_err());
+    assert!(
+        streamer
+            .build_repacked_batch("tensor_127", 0, 0, &w127)
+            .is_err()
+    );
 
     // 129 bytes -> rejected
     let w129 = vec![1i8; 129];
-    assert!(streamer.build_repacked_batch("tensor_129", 0, 0, &w129).is_err());
+    assert!(
+        streamer
+            .build_repacked_batch("tensor_129", 0, 0, &w129)
+            .is_err()
+    );
 
     // Exactly 128 bytes -> ok
     let w128 = vec![1i8; 128];
-    assert!(streamer.build_repacked_batch("tensor_128", 0, 0, &w128).is_ok());
+    assert!(
+        streamer
+            .build_repacked_batch("tensor_128", 0, 0, &w128)
+            .is_ok()
+    );
 
     // Exactly 256 bytes -> ok
     let w256 = vec![1i8; 256];
-    assert!(streamer.build_repacked_batch("tensor_256", 0, 0, &w256).is_ok());
+    assert!(
+        streamer
+            .build_repacked_batch("tensor_256", 0, 0, &w256)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -332,7 +410,9 @@ fn challenge_flight_receive_to_memfd_fd_validity() {
 
     // Verify whether raw_fd is open and valid in the kernel:
     let fd_flags_immediate = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
-    println!("VERIFICATION: receive_to_memfd returned raw_fd={raw_fd}, immediate fcntl(F_GETFD)={fd_flags_immediate}");
+    println!(
+        "VERIFICATION: receive_to_memfd returned raw_fd={raw_fd}, immediate fcntl(F_GETFD)={fd_flags_immediate}"
+    );
 
     assert!(
         fd_flags_immediate >= 0,
@@ -373,7 +453,10 @@ fn challenge_flight_receiver_malformed_batch_schema() {
     // Must not panic on schema mismatch
     assert!(res.is_ok(), "write_batch must not panic on schema mismatch");
     let write_res = res.unwrap();
-    assert!(write_res.is_err(), "write_batch must return Err on schema mismatch");
+    assert!(
+        write_res.is_err(),
+        "write_batch must return Err on schema mismatch"
+    );
     match write_res.unwrap_err() {
         FlightError::InvalidBatch(msg) => {
             assert!(msg.contains("requires at least 6 columns"));
@@ -394,7 +477,9 @@ fn challenge_flight_sparse_offset_stream_handling() {
     // Batch 1 is at offset 0
     let batch1 = streamer.build_repacked_batch("layer0", 0, 0, &w1).unwrap();
     // Batch 2 is at sparse offset 65536 (64KB in)
-    let batch2 = streamer.build_repacked_batch("layer1", 1, 65536, &w2).unwrap();
+    let batch2 = streamer
+        .build_repacked_batch("layer1", 1, 65536, &w2)
+        .unwrap();
 
     let flight_stream = FlightStream::new(vec![batch1, batch2]);
 

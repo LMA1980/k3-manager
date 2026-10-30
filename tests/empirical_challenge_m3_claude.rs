@@ -217,10 +217,11 @@ async fn test_empirical_consecutive_user_turns_and_role_invariants() {
     };
     let err: ClaudeErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(err.error.r#type, "invalid_request_error");
-    assert!(err
-        .error
-        .message
-        .contains("first message must have role 'user'"));
+    assert!(
+        err.error
+            .message
+            .contains("first message must have role 'user'")
+    );
 
     // Case 1g: Consecutive assistant messages -> HTTP 400
     let req_consec_assistant = ClaudeMessageRequest {
@@ -581,8 +582,11 @@ async fn test_empirical_multipart_content_blocks_text_images_tools() {
     // Verify all multi-part elements are represented in canonical prompt
     assert!(prompt.contains("[System: Multi-modal assistant]"));
     assert!(prompt.contains("User: Inspect diagram A:[Image]And compare with diagram B:[Image]"));
-    assert!(prompt
-        .contains("Assistant: [Thinking: Need to query database for image metadata.]<tool_call>"));
+    assert!(
+        prompt.contains(
+            "Assistant: [Thinking: Need to query database for image metadata.]<tool_call>"
+        )
+    );
     assert!(prompt.contains("\"table\":\"images\""));
     assert!(prompt.contains("</tool_call>"));
     assert!(prompt.contains("User: <tool_response>"));
@@ -888,10 +892,12 @@ async fn test_empirical_sse_lifecycle_strict_ordering_and_framing() {
     assert_eq!(parsed_events[2].0, "content_block_delta");
     assert_eq!(parsed_events[2].1["index"], 0);
     assert_eq!(parsed_events[2].1["delta"]["type"], "thinking_delta");
-    assert!(!parsed_events[2].1["delta"]["thinking"]
-        .as_str()
-        .unwrap()
-        .is_empty());
+    assert!(
+        !parsed_events[2].1["delta"]["thinking"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
 
     // 4. content_block_stop (index 0)
     assert_eq!(parsed_events[3].0, "content_block_stop");
@@ -906,10 +912,12 @@ async fn test_empirical_sse_lifecycle_strict_ordering_and_framing() {
     assert_eq!(parsed_events[5].0, "content_block_delta");
     assert_eq!(parsed_events[5].1["index"], 1);
     assert_eq!(parsed_events[5].1["delta"]["type"], "text_delta");
-    assert!(!parsed_events[5].1["delta"]["text"]
-        .as_str()
-        .unwrap()
-        .is_empty());
+    assert!(
+        !parsed_events[5].1["delta"]["text"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
 
     // 7. content_block_stop (index 1)
     assert_eq!(parsed_events[6].0, "content_block_stop");
@@ -1036,33 +1044,37 @@ async fn test_empirical_queue_saturation_http_529_and_retry_after_header() {
     );
 
     // Admit 2 requests to fill queue
-    assert!(runtime
-        .queue_mgr()
-        .admit_to_model(
-            "claude-capacity-model",
-            "fill-1".to_owned(),
-            false,
-            None,
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            None,
-            None,
-        )
-        .is_ok());
+    assert!(
+        runtime
+            .queue_mgr()
+            .admit_to_model(
+                "claude-capacity-model",
+                "fill-1".to_owned(),
+                false,
+                None,
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+            )
+            .is_ok()
+    );
 
-    assert!(runtime
-        .queue_mgr()
-        .admit_to_model(
-            "claude-capacity-model",
-            "fill-2".to_owned(),
-            false,
-            None,
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            None,
-            None,
-        )
-        .is_ok());
+    assert!(
+        runtime
+            .queue_mgr()
+            .admit_to_model(
+                "claude-capacity-model",
+                "fill-2".to_owned(),
+                false,
+                None,
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                None,
+            )
+            .is_ok()
+    );
 
     // 1. Non-streaming request arriving while saturated -> HTTP 529
     let req_non_stream = ClaudeMessageRequest {
@@ -1393,9 +1405,7 @@ async fn test_challenge_claude_client_early_disconnect_cleans_up_queue_permits()
     for i in 0..5 {
         let (mut client, server_stream) = tokio::io::duplex(4096);
         let srv = ProtocolServer::new(ProtocolServerConfig::default(), Arc::clone(&runtime));
-        let server_handle = tokio::spawn(async move {
-            srv.handle_connection(server_stream).await
-        });
+        let server_handle = tokio::spawn(async move { srv.handle_connection(server_stream).await });
 
         let msg_req = serde_json::json!({
             "model": "claude-permit-check",
@@ -1443,6 +1453,8 @@ async fn test_challenge_claude_client_early_disconnect_cleans_up_queue_permits()
         top_p: None,
     };
     let resp = ClaudeAdapter::handle_messages(final_req, runtime).await;
-    assert_eq!(resp.status, 200, "Subsequent request should succeed with 200");
+    assert_eq!(
+        resp.status, 200,
+        "Subsequent request should succeed with 200"
+    );
 }
-

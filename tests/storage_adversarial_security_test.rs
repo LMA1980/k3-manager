@@ -19,18 +19,18 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use k3_core::profile::TuningProfile;
 use k3_core::K3Error;
+use k3_core::profile::TuningProfile;
 use k3_manager::persistence::{
     CasCatalog, DuckDbPersistenceStore, ModelAliasRecord, ModelBlobRecord, ModelManifestRecord,
     PersistenceStore, Project, SessionLastTurn, Tenant,
 };
 use k3_manager::store::{
-    parse_alias_id, validate_path_component, validate_sha256_digest, ContentAddressedStore,
-    ModelManifest, Sha256,
+    ContentAddressedStore, ModelManifest, Sha256, parse_alias_id, validate_path_component,
+    validate_sha256_digest,
 };
 
 static GLOBAL_SEQ: AtomicU64 = AtomicU64::new(300);
@@ -291,35 +291,37 @@ fn test_duckdb_sql_injection_defense() {
 #[test]
 fn test_validate_sha256_digest_strictness() {
     // Uppercase hex must fail
-    assert!(validate_sha256_digest(
-        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855")
+            .is_err()
+    );
     // Leading/trailing whitespace must fail
-    assert!(validate_sha256_digest(
-        " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 "
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest(
+            " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 "
+        )
+        .is_err()
+    );
     // 63 chars (too short)
-    assert!(validate_sha256_digest(
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85")
+            .is_err()
+    );
     // 65 chars (too long)
-    assert!(validate_sha256_digest(
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855a"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855a")
+            .is_err()
+    );
     // Illegal chars
-    assert!(validate_sha256_digest(
-        "g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .is_err()
+    );
     // Valid 64 lowercase hex
-    assert!(validate_sha256_digest(
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    )
-    .is_ok());
+    assert!(
+        validate_sha256_digest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .is_ok()
+    );
 }
 
 #[test]

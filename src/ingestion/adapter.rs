@@ -339,7 +339,10 @@ impl fmt::Display for IngestionError {
             Self::NetworkError(msg) => write!(f, "[ingestion network error] {msg}"),
             Self::ModelNotFound(msg) => write!(f, "[ingestion model not found] {msg}"),
             Self::CorruptedFormat { format, reason } => {
-                write!(f, "[ingestion format error] format '{format}' invalid: {reason}")
+                write!(
+                    f,
+                    "[ingestion format error] format '{format}' invalid: {reason}"
+                )
             }
             Self::DigestMismatch { expected, actual } => write!(
                 f,
@@ -470,9 +473,7 @@ pub trait SourceAdapter: Send + Sync + fmt::Debug {
         let part_filename = super::staging::StagingPipeline::generate_uuid_part_filename();
         let part_path = staging_dir.join(part_filename);
 
-        let summary = self
-            .pull(&req, &part_path, None)
-            .map_err(K3Error::from)?;
+        let summary = self.pull(&req, &part_path, None).map_err(K3Error::from)?;
 
         Ok(StagingDownload {
             staging_path: summary.staging_path,

@@ -63,7 +63,10 @@ impl std::fmt::Display for FlightError {
                 write!(f, "[flight memory lock error] {e}")
             }
             Self::MemfdSealed => {
-                write!(f, "[flight error] EPERM: cannot write to F_SEAL_WRITE sealed memfd")
+                write!(
+                    f,
+                    "[flight error] EPERM: cannot write to F_SEAL_WRITE sealed memfd"
+                )
             }
             Self::InvalidBatch(msg) => write!(f, "[flight invalid batch] {msg}"),
             Self::TransportError(msg) => write!(f, "[flight transport error] {msg}"),
@@ -134,14 +137,14 @@ impl MemfdArena {
     /// Returns [`FlightError::AllocationFailed`] on OS allocation or mapping error.
     pub fn new(name: &str, capacity_bytes: usize) -> Result<Self, FlightError> {
         // SAFETY: sysconf reads standard system page size.
-        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+        let page_size =
+            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
         let aligned_len = ((capacity_bytes.max(1) + page_size - 1) / page_size) * page_size;
 
         #[cfg(target_os = "linux")]
         {
-            let cname = std::ffi::CString::new(name).map_err(|e| {
-                FlightError::AllocationFailed(format!("invalid memfd name: {e}"))
-            })?;
+            let cname = std::ffi::CString::new(name)
+                .map_err(|e| FlightError::AllocationFailed(format!("invalid memfd name: {e}")))?;
 
             // SAFETY: libc::memfd_create creates an anonymous in-memory file with sealing support.
             let raw_fd = unsafe {
@@ -199,17 +202,21 @@ impl MemfdArena {
             .unwrap_or_default()
             .as_nanos();
 
-        let temp_path = std::env::temp_dir().join(format!("k3_flight_{name}_{pid}_{seq}_{nanos}.part"));
+        let temp_path =
+            std::env::temp_dir().join(format!("k3_flight_{name}_{pid}_{seq}_{nanos}.part"));
         let file = File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&temp_path)
-            .map_err(|e| FlightError::AllocationFailed(format!("failed to open temp shm file: {e}")))?;
+            .map_err(|e| {
+                FlightError::AllocationFailed(format!("failed to open temp shm file: {e}"))
+            })?;
 
-        file.set_len(aligned_len as u64)
-            .map_err(|e| FlightError::AllocationFailed(format!("failed to truncate shm file: {e}")))?;
+        file.set_len(aligned_len as u64).map_err(|e| {
+            FlightError::AllocationFailed(format!("failed to truncate shm file: {e}"))
+        })?;
 
         let raw_fd = file.as_raw_fd();
         // SAFETY: mmap maps the file into process virtual memory with MAP_SHARED.
@@ -233,9 +240,8 @@ impl MemfdArena {
         // Unlink immediately from disk so memory is held solely via the open file descriptor
         let _ = std::fs::remove_file(&temp_path);
 
-        let non_null = NonNull::new(ptr.cast::<u8>()).ok_or_else(|| {
-            FlightError::AllocationFailed("null pointer from mmap".to_owned())
-        })?;
+        let non_null = NonNull::new(ptr.cast::<u8>())
+            .ok_or_else(|| FlightError::AllocationFailed("null pointer from mmap".to_owned()))?;
 
         // SAFETY: zero-initializing anonymous memory mapping.
         unsafe {
@@ -388,6 +394,13 @@ impl MemfdArena {
 
         #[cfg(target_os = "linux")]
         {
+            // SAFETY: Unmap writable MAP_SHARED VMA first so i_mmap_writable drops to 0;
+            // Linux kernel rejects F_SEAL_WRITE with EBUSY while any writable/VM_MAYWRITE
+            // shared mapping exists. The backing memfd retains all written pages in RAM.
+            unsafe {
+                libc::munmap(self.ptr.as_ptr().cast(), self.len);
+            }
+
             // SAFETY: fcntl F_ADD_SEALS applies seals to memfd descriptor.
             let ret = unsafe {
                 libc::fcntl(
@@ -398,16 +411,66 @@ impl MemfdArena {
             };
             if ret != 0 {
                 let err = io::Error::last_os_error();
+                // Restore mapping on failure so Drop remains valid
+                // SAFETY: Re-mapping valid memfd on error recovery path.
+                let restore_ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        self.len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        self.as_raw_fd(),
+                        0,
+                    )
+                };
+                if restore_ptr != libc::MAP_FAILED
+                    && let Some(nn) = NonNull::new(restore_ptr.cast::<u8>())
+                {
+                    self.ptr = nn;
+                }
                 return Err(FlightError::AllocationFailed(format!(
                     "fcntl F_ADD_SEALS failed: {err}"
                 )));
             }
+
+            // SAFETY: Re-map memfd as read-only MAP_SHARED now that F_SEAL_WRITE is active.
+            let ro_ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    self.len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    self.as_raw_fd(),
+                    0,
+                )
+            };
+            if ro_ptr == libc::MAP_FAILED {
+                let err = io::Error::last_os_error();
+                return Err(FlightError::AllocationFailed(format!(
+                    "read-only mmap after F_ADD_SEALS failed: {err}"
+                )));
+            }
+            let non_null = NonNull::new(ro_ptr.cast::<u8>()).ok_or_else(|| {
+                FlightError::AllocationFailed("null pointer from read-only mmap".to_owned())
+            })?;
+            self.ptr = non_null;
+
+            if self.locked {
+                // SAFETY: Re-lock the newly mapped read-only VMA if mlock was previously active.
+                let lock_ret = unsafe { libc::mlock(self.ptr.as_ptr().cast(), self.len) };
+                if lock_ret != 0 {
+                    self.locked = false;
+                }
+            }
         }
 
-        // Hardware memory protection: make mapped virtual memory read-only on all platforms
-        // SAFETY: mprotect marks memory read-only.
-        unsafe {
-            libc::mprotect(self.ptr.as_ptr().cast(), self.len, libc::PROT_READ);
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Hardware memory protection: make mapped virtual memory read-only on non-Linux platforms
+            // SAFETY: mprotect marks memory read-only.
+            unsafe {
+                libc::mprotect(self.ptr.as_ptr().cast(), self.len, libc::PROT_READ);
+            }
         }
 
         self.sealed = true;

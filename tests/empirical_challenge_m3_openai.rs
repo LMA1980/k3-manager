@@ -29,10 +29,10 @@ use k3_core::affinity::ControlPlaneCapacityConfig;
 use k3_core::profile::{ComputePool, PriorityClass, TuningProfile};
 use k3_manager::domain::{MockOsAffinityBackend, OsAffinityBackend};
 use k3_manager::protocol::{
-    HttpRequest, HttpResponseBody, OpenAiAdapter, OpenAiChatRequest, OpenAiChatResponse,
-    OpenAiErrorResponse, OpenAiFunction, OpenAiFunctionCall, OpenAiMessage, OpenAiTool,
-    OpenAiToolCall, ProtocolServer, ProtocolServerConfig, ServerError,
-    DEFAULT_MAX_REQUEST_BODY_BYTES, MAX_REQUEST_HEADERS_BYTES,
+    DEFAULT_MAX_REQUEST_BODY_BYTES, HttpRequest, HttpResponseBody, MAX_REQUEST_HEADERS_BYTES,
+    OpenAiAdapter, OpenAiChatRequest, OpenAiChatResponse, OpenAiErrorResponse, OpenAiFunction,
+    OpenAiFunctionCall, OpenAiMessage, OpenAiTool, OpenAiToolCall, ProtocolServer,
+    ProtocolServerConfig, ServerError,
 };
 use k3_manager::queue::AdmissionQueueConfig;
 use k3_manager::runtime::{AdminCommand, ControlPlaneRuntime};
@@ -177,12 +177,20 @@ async fn test_challenge_syntax_corruption_and_non_utf8_returns_400() {
     setup_model(&runtime, "qwen2.5-edge", 2048);
 
     // Case A: Truncated JSON
-    let req_trunc = HttpRequest::new("POST", "/v1/chat/completions", b"{\"model\": \"qwen2.5-edge\", \"messages\": [{\"role\": \"user\"".to_vec());
+    let req_trunc = HttpRequest::new(
+        "POST",
+        "/v1/chat/completions",
+        b"{\"model\": \"qwen2.5-edge\", \"messages\": [{\"role\": \"user\"".to_vec(),
+    );
     let resp_trunc = OpenAiAdapter::handle_http(req_trunc, Arc::clone(&runtime)).await;
     assert_eq!(resp_trunc.status, 400);
 
     // Case B: Completely non-UTF8 bytes
-    let req_bad_bytes = HttpRequest::new("POST", "/v1/chat/completions", vec![0xFF, 0xFE, 0xFD, 0x00, 0x80]);
+    let req_bad_bytes = HttpRequest::new(
+        "POST",
+        "/v1/chat/completions",
+        vec![0xFF, 0xFE, 0xFD, 0x00, 0x80],
+    );
     let resp_bad_bytes = OpenAiAdapter::handle_http(req_bad_bytes, Arc::clone(&runtime)).await;
     assert_eq!(resp_bad_bytes.status, 400);
 
@@ -292,7 +300,9 @@ async fn test_challenge_context_length_boundary_and_strict_rejection() {
     // "One two three four five six seven eight nine ten eleven" (11 words > 10)
     let req_overflow = OpenAiChatRequest {
         model: "constrained-boundary".to_owned(),
-        messages: vec![OpenAiMessage::user("One two three four five six seven eight nine ten eleven")],
+        messages: vec![OpenAiMessage::user(
+            "One two three four five six seven eight nine ten eleven",
+        )],
         stream: Some(false),
         tools: None,
         tool_choice: None,
@@ -302,7 +312,8 @@ async fn test_challenge_context_length_boundary_and_strict_rejection() {
         top_p: None,
         stop: None,
     };
-    let resp_overflow = OpenAiAdapter::handle_chat_completions(req_overflow, Arc::clone(&runtime)).await;
+    let resp_overflow =
+        OpenAiAdapter::handle_chat_completions(req_overflow, Arc::clone(&runtime)).await;
     assert_eq!(resp_overflow.status, 400);
 
     let body = match resp_overflow.body {
@@ -396,7 +407,8 @@ async fn test_challenge_queue_saturation_retry_after_header_format() {
         top_p: None,
         stop: None,
     };
-    let resp_non_stream = OpenAiAdapter::handle_chat_completions(req_non_stream, Arc::clone(&runtime)).await;
+    let resp_non_stream =
+        OpenAiAdapter::handle_chat_completions(req_non_stream, Arc::clone(&runtime)).await;
     assert_eq!(resp_non_stream.status, 429);
 
     let retry_after_header = resp_non_stream
@@ -405,7 +417,10 @@ async fn test_challenge_queue_saturation_retry_after_header_format() {
         .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
         .map(|(_, v)| v.as_str());
     assert!(retry_after_header.is_some(), "missing Retry-After header");
-    let secs: u64 = retry_after_header.unwrap().parse().expect("valid integer seconds in Retry-After");
+    let secs: u64 = retry_after_header
+        .unwrap()
+        .parse()
+        .expect("valid integer seconds in Retry-After");
     assert!(secs > 0);
 
     // 2. Streaming saturation check
@@ -421,7 +436,8 @@ async fn test_challenge_queue_saturation_retry_after_header_format() {
         top_p: None,
         stop: None,
     };
-    let resp_stream = OpenAiAdapter::handle_chat_completions(req_stream, Arc::clone(&runtime)).await;
+    let resp_stream =
+        OpenAiAdapter::handle_chat_completions(req_stream, Arc::clone(&runtime)).await;
     assert_eq!(resp_stream.status, 429);
     let s_retry = resp_stream
         .headers
@@ -498,12 +514,11 @@ async fn test_challenge_server_connection_stream_immediate_413_on_content_length
     // Create duplex in-memory socket pair
     let (mut client, server_stream) = tokio::io::duplex(8192);
 
-    let server_handle = tokio::spawn(async move {
-        server.handle_connection(server_stream).await
-    });
+    let server_handle = tokio::spawn(async move { server.handle_connection(server_stream).await });
 
     // Client sends request claiming Content-Length: 5000000 (> 1024)
-    let wire_header = "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5000000\r\n\r\n";
+    let wire_header =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5000000\r\n\r\n";
     client.write_all(wire_header.as_bytes()).await.unwrap();
     client.flush().await.unwrap();
 
@@ -531,12 +546,13 @@ async fn test_challenge_server_headers_too_large_rejection() {
     let server = ProtocolServer::new(server_config, runtime);
 
     let (mut client, server_stream) = tokio::io::duplex(8192);
-    let server_handle = tokio::spawn(async move {
-        server.handle_connection(server_stream).await
-    });
+    let server_handle = tokio::spawn(async move { server.handle_connection(server_stream).await });
 
     // Send 3000 bytes of headers without \r\n\r\n
-    let huge_header = format!("POST /v1/chat/completions HTTP/1.1\r\nX-Spam: {}\r\n", "A".repeat(3000));
+    let huge_header = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nX-Spam: {}\r\n",
+        "A".repeat(3000)
+    );
     client.write_all(huge_header.as_bytes()).await.unwrap();
     client.flush().await.unwrap();
 
@@ -556,9 +572,7 @@ async fn test_challenge_server_socket_read_timeout() {
     let server = ProtocolServer::new(server_config, runtime);
 
     let (mut client, server_stream) = tokio::io::duplex(1024);
-    let server_handle = tokio::spawn(async move {
-        server.handle_connection(server_stream).await
-    });
+    let server_handle = tokio::spawn(async move { server.handle_connection(server_stream).await });
 
     // Write incomplete request and do not finish headers
     client.write_all(b"POST /v1/chat").await.unwrap();
@@ -580,9 +594,7 @@ async fn test_challenge_sse_full_lifecycle_and_chunked_wire_framing() {
     let server = ProtocolServer::new(ProtocolServerConfig::default(), Arc::clone(&runtime));
     let (mut client, server_stream) = tokio::io::duplex(16384);
 
-    let server_handle = tokio::spawn(async move {
-        server.handle_connection(server_stream).await
-    });
+    let server_handle = tokio::spawn(async move { server.handle_connection(server_stream).await });
 
     let chat_req = serde_json::json!({
         "model": "qwen-sse-wire",
@@ -643,9 +655,7 @@ async fn test_challenge_sse_client_early_disconnect_does_not_panic() {
     let server = ProtocolServer::new(ProtocolServerConfig::default(), Arc::clone(&runtime));
     let (mut client, server_stream) = tokio::io::duplex(4096);
 
-    let server_handle = tokio::spawn(async move {
-        server.handle_connection(server_stream).await
-    });
+    let server_handle = tokio::spawn(async move { server.handle_connection(server_stream).await });
 
     let chat_req = serde_json::json!({
         "model": "qwen-sse-drop",
@@ -728,7 +738,9 @@ async fn test_challenge_multi_tool_declarations_and_keyword_dispatch() {
     // Query targeting tool 3: "execute_sql_query"
     let req = OpenAiChatRequest {
         model: "qwen-tools-multi".to_owned(),
-        messages: vec![OpenAiMessage::user("Please execute_sql_query for active users.")],
+        messages: vec![OpenAiMessage::user(
+            "Please execute_sql_query for active users.",
+        )],
         stream: Some(false),
         tools: Some(tools),
         tool_choice: None,
@@ -747,7 +759,10 @@ async fn test_challenge_multi_tool_declarations_and_keyword_dispatch() {
         _ => panic!("expected buffered byte body"),
     };
     let completion: OpenAiChatResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(completion.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(
+        completion.choices[0].finish_reason.as_deref(),
+        Some("tool_calls")
+    );
 
     let tc = &completion.choices[0].message.tool_calls.as_ref().unwrap()[0];
     assert_eq!(tc.function.name, "execute_sql_query");
@@ -818,7 +833,8 @@ async fn test_challenge_nested_arguments_pass_through_intact() {
         stop: None,
     };
 
-    let resp_non_stream = OpenAiAdapter::handle_chat_completions(req_non_stream, Arc::clone(&runtime)).await;
+    let resp_non_stream =
+        OpenAiAdapter::handle_chat_completions(req_non_stream, Arc::clone(&runtime)).await;
     assert_eq!(resp_non_stream.status, 200);
 
     let body = match resp_non_stream.body {
@@ -913,12 +929,18 @@ async fn test_challenge_url_query_parameter_route_tolerance() {
     // 1. GET /v1/models?limit=10 on ProtocolServer
     let req_models_query = HttpRequest::new("GET", "/v1/models?limit=10", Vec::new());
     let resp_models_query = server.route_request(req_models_query).await;
-    assert_eq!(resp_models_query.status, 200, "ProtocolServer should accept /v1/models?limit=10");
+    assert_eq!(
+        resp_models_query.status, 200,
+        "ProtocolServer should accept /v1/models?limit=10"
+    );
 
     // 2. GET /models?offset=0&limit=5 on ProtocolServer
     let req_models_query2 = HttpRequest::new("GET", "/models?offset=0&limit=5", Vec::new());
     let resp_models_query2 = server.route_request(req_models_query2).await;
-    assert_eq!(resp_models_query2.status, 200, "ProtocolServer should accept /models?offset=0&limit=5");
+    assert_eq!(
+        resp_models_query2.status, 200,
+        "ProtocolServer should accept /models?offset=0&limit=5"
+    );
 
     // 4. POST /v1/chat/completions?extra_param=1 on ProtocolServer
     let chat_body = serde_json::json!({
@@ -927,23 +949,51 @@ async fn test_challenge_url_query_parameter_route_tolerance() {
         "stream": false
     })
     .to_string();
-    let req_chat_query = HttpRequest::new("POST", "/v1/chat/completions?extra_param=1", chat_body.clone().into_bytes());
+    let req_chat_query = HttpRequest::new(
+        "POST",
+        "/v1/chat/completions?extra_param=1",
+        chat_body.clone().into_bytes(),
+    );
     let resp_chat_query = server.route_request(req_chat_query).await;
-    println!("ProtocolServer POST /v1/chat/completions?extra_param=1 status: {}", resp_chat_query.status);
+    println!(
+        "ProtocolServer POST /v1/chat/completions?extra_param=1 status: {}",
+        resp_chat_query.status
+    );
 
     // 3. GET /v1/models?limit=10 on OpenAiAdapter::handle_http
     let req_adapter_models = HttpRequest::new("GET", "/v1/models?limit=10", Vec::new());
-    let resp_adapter_models = OpenAiAdapter::handle_http(req_adapter_models, Arc::clone(&runtime)).await;
-    println!("OpenAiAdapter GET /v1/models?limit=10 status: {}", resp_adapter_models.status);
+    let resp_adapter_models =
+        OpenAiAdapter::handle_http(req_adapter_models, Arc::clone(&runtime)).await;
+    println!(
+        "OpenAiAdapter GET /v1/models?limit=10 status: {}",
+        resp_adapter_models.status
+    );
 
     // 5. POST /v1/chat/completions?api_version=2024 on OpenAiAdapter::handle_http
-    let req_adapter_chat = HttpRequest::new("POST", "/v1/chat/completions?api_version=2024", chat_body.into_bytes());
-    let resp_adapter_chat = OpenAiAdapter::handle_http(req_adapter_chat, Arc::clone(&runtime)).await;
-    println!("OpenAiAdapter POST /v1/chat/completions?api_version=2024 status: {}", resp_adapter_chat.status);
+    let req_adapter_chat = HttpRequest::new(
+        "POST",
+        "/v1/chat/completions?api_version=2024",
+        chat_body.into_bytes(),
+    );
+    let resp_adapter_chat =
+        OpenAiAdapter::handle_http(req_adapter_chat, Arc::clone(&runtime)).await;
+    println!(
+        "OpenAiAdapter POST /v1/chat/completions?api_version=2024 status: {}",
+        resp_adapter_chat.status
+    );
 
-    assert_eq!(resp_chat_query.status, 200, "ProtocolServer should accept /v1/chat/completions?extra_param=1");
-    assert_eq!(resp_adapter_models.status, 200, "OpenAiAdapter::handle_http should accept /v1/models?limit=10");
-    assert_eq!(resp_adapter_chat.status, 200, "OpenAiAdapter::handle_http should accept /v1/chat/completions?api_version=2024");
+    assert_eq!(
+        resp_chat_query.status, 200,
+        "ProtocolServer should accept /v1/chat/completions?extra_param=1"
+    );
+    assert_eq!(
+        resp_adapter_models.status, 200,
+        "OpenAiAdapter::handle_http should accept /v1/models?limit=10"
+    );
+    assert_eq!(
+        resp_adapter_chat.status, 200,
+        "OpenAiAdapter::handle_http should accept /v1/chat/completions?api_version=2024"
+    );
 }
 
 #[tokio::test]
@@ -955,9 +1005,7 @@ async fn test_challenge_client_early_disconnect_cleans_up_queue_permits() {
     for i in 0..5 {
         let (mut client, server_stream) = tokio::io::duplex(4096);
         let srv = ProtocolServer::new(ProtocolServerConfig::default(), Arc::clone(&runtime));
-        let server_handle = tokio::spawn(async move {
-            srv.handle_connection(server_stream).await
-        });
+        let server_handle = tokio::spawn(async move { srv.handle_connection(server_stream).await });
 
         let chat_req = serde_json::json!({
             "model": "qwen-permit-check",
@@ -1007,6 +1055,8 @@ async fn test_challenge_client_early_disconnect_cleans_up_queue_permits() {
         stop: None,
     };
     let resp = OpenAiAdapter::handle_chat_completions(final_req, runtime).await;
-    assert_eq!(resp.status, 200, "Subsequent request should succeed with 200");
+    assert_eq!(
+        resp.status, 200,
+        "Subsequent request should succeed with 200"
+    );
 }
-

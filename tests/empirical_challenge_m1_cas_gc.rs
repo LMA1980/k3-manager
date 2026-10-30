@@ -115,23 +115,23 @@ fn test_challenge1a_path_component_validation_boundaries() {
 
     // 2. Traversal patterns and forbidden characters
     let forbidden = [
-        "",                     // Empty
-        ".",                    // Single dot
-        "..",                   // Parent directory
-        "../",                  // Relative parent
-        "/etc/passwd",          // Absolute path
-        "foo/bar",              // Slashes
-        "foo\\bar",             // Backslashes
-        "foo\0bar",             // Null byte
-        "-flag",                // Leading dash
-        "--opt",                // Double leading dash
-        "foo bar",              // Space
-        "foo\tbar",             // Tab
-        "foo\nbar",             // Newline
-        "foo\rbar",             // Carriage return
-        "foo\x1b[31mbar",        // ANSI escape
-        "café",                 // Non-ASCII unicode
-        "foo%2e%2e%2fbar",      // URL-encoded percent
+        "",                // Empty
+        ".",               // Single dot
+        "..",              // Parent directory
+        "../",             // Relative parent
+        "/etc/passwd",     // Absolute path
+        "foo/bar",         // Slashes
+        "foo\\bar",        // Backslashes
+        "foo\0bar",        // Null byte
+        "-flag",           // Leading dash
+        "--opt",           // Double leading dash
+        "foo bar",         // Space
+        "foo\tbar",        // Tab
+        "foo\nbar",        // Newline
+        "foo\rbar",        // Carriage return
+        "foo\x1b[31mbar",  // ANSI escape
+        "café",            // Non-ASCII unicode
+        "foo%2e%2e%2fbar", // URL-encoded percent
     ];
 
     for case in forbidden {
@@ -146,14 +146,14 @@ fn test_challenge1a_path_component_validation_boundaries() {
 #[test]
 fn test_challenge1b_alias_id_parser_defense() {
     let invalid_aliases = [
-        "huggingface/Qwen/Qwen2.5-7B",                    // Only 3 parts
-        "huggingface/Qwen/Qwen2.5-7B/latest/extra",      // 5 parts
-        "",                                              // Empty
-        "models/huggingface/Qwen",                       // 2 parts after models/
-        "models//Qwen/Qwen2.5-7B/latest",                // Empty part
-        "models/huggingface/../Qwen2.5-7B/latest",        // Traversal part
-        "/etc/passwd/root/model/v1",                     // Leading slash creates empty segment
-        "models/huggingface/Qwen/name/tag\0injection",   // Null byte in tag
+        "huggingface/Qwen/Qwen2.5-7B",                 // Only 3 parts
+        "huggingface/Qwen/Qwen2.5-7B/latest/extra",    // 5 parts
+        "",                                            // Empty
+        "models/huggingface/Qwen",                     // 2 parts after models/
+        "models//Qwen/Qwen2.5-7B/latest",              // Empty part
+        "models/huggingface/../Qwen2.5-7B/latest",     // Traversal part
+        "/etc/passwd/root/model/v1",                   // Leading slash creates empty segment
+        "models/huggingface/Qwen/name/tag\0injection", // Null byte in tag
     ];
 
     for alias in invalid_aliases {
@@ -166,10 +166,16 @@ fn test_challenge1b_alias_id_parser_defense() {
 
     // Valid alias with models/ prefix and without
     let (s, ns, n, t) = parse_alias_id("models/hf/org/model/tag").expect("valid alias with prefix");
-    assert_eq!((s.as_str(), ns.as_str(), n.as_str(), t.as_str()), ("hf", "org", "model", "tag"));
+    assert_eq!(
+        (s.as_str(), ns.as_str(), n.as_str(), t.as_str()),
+        ("hf", "org", "model", "tag")
+    );
 
     let (s, ns, n, t) = parse_alias_id("hf/org/model/tag").expect("valid alias without prefix");
-    assert_eq!((s.as_str(), ns.as_str(), n.as_str(), t.as_str()), ("hf", "org", "model", "tag"));
+    assert_eq!(
+        (s.as_str(), ns.as_str(), n.as_str(), t.as_str()),
+        ("hf", "org", "model", "tag")
+    );
 }
 
 #[test]
@@ -206,7 +212,10 @@ fn test_challenge1c_derived_manager_path_traversal_gap() {
     );
 
     println!("get_or_create_derived_layout with traversal source path: {res:?}");
-    assert!(res.is_err(), "path traversal in source_digest must be rejected");
+    assert!(
+        res.is_err(),
+        "path traversal in source_digest must be rejected"
+    );
     assert!(
         leak_captured.is_empty(),
         "converter must never be executed on traversal inputs"
@@ -430,7 +439,9 @@ fn test_challenge4a_dual_gate_lock_and_map_stress() {
     let (staging, mut f) = store.create_staging_file().unwrap();
     f.write_all(&payload).unwrap();
     drop(f);
-    let blob_path = store.promote_staged_blob(&staging, &digest, "gguf").unwrap();
+    let blob_path = store
+        .promote_staged_blob(&staging, &digest, "gguf")
+        .unwrap();
 
     let manifest = ModelManifest {
         schema_version: 1,
@@ -447,7 +458,13 @@ fn test_challenge4a_dual_gate_lock_and_map_stress() {
     };
     let man_rec = store.register_manifest(&manifest).unwrap();
     store
-        .create_alias("local", "app", "model-z", "active", &man_rec.manifest_digest)
+        .create_alias(
+            "local",
+            "app",
+            "model-z",
+            "active",
+            &man_rec.manifest_digest,
+        )
         .unwrap();
 
     // Verify ref_count > 0 prevents GC
@@ -456,7 +473,9 @@ fn test_challenge4a_dual_gate_lock_and_map_stress() {
     assert!(blob_path.exists());
 
     // Operator deletes alias: ref_count becomes 0
-    store.remove_alias("local", "app", "model-z", "active").unwrap();
+    store
+        .remove_alias("local", "app", "model-z", "active")
+        .unwrap();
     let unref = catalog.list_unreferenced_blobs().unwrap();
     assert_eq!(unref.len(), 1);
     assert_eq!(unref[0].digest, digest);
@@ -552,7 +571,9 @@ fn test_challenge4b_watermark_warning_non_destructive() {
     let (staging, mut f) = store.create_staging_file().unwrap();
     f.write_all(&payload).unwrap();
     drop(f);
-    let blob_path = store.promote_staged_blob(&staging, &digest, "gguf").unwrap();
+    let blob_path = store
+        .promote_staged_blob(&staging, &digest, "gguf")
+        .unwrap();
 
     let warning = gc.check_watermark().unwrap().expect("warning emitted");
     assert_eq!(warning.threshold_bytes, 10_000);

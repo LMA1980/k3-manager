@@ -19,16 +19,16 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use duckdb::{params, Connection};
-use k3_core::profile::CONSTRAINED_TEST_N_CTX;
+use duckdb::{Connection, params};
 use k3_core::K3Error;
+use k3_core::profile::CONSTRAINED_TEST_N_CTX;
 use k3_manager::persistence::{CasCatalog, DuckDbPersistenceStore};
 use k3_manager::store::{
-    check_derived_memory_admission, CapabilityFilter, ContentAddressedStore, ModelManifest,
-    RetentionPolicy, Sha256,
+    CapabilityFilter, ContentAddressedStore, ModelManifest, RetentionPolicy, Sha256,
+    check_derived_memory_admission,
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -834,14 +834,16 @@ fn test_tier1_us21_memory_admission_derived_footprint() {
     assert_eq!(err.diagnostic_code(), "insufficient_lockable_memory");
 
     // Total required within limit (e.g. 80MB cap) -> Accepted
-    assert!(check_derived_memory_admission(
-        source_bytes,
-        derived_bytes,
-        kv_bytes,
-        available_ram,
-        80 * 1024 * 1024u64,
-    )
-    .is_ok());
+    assert!(
+        check_derived_memory_admission(
+            source_bytes,
+            derived_bytes,
+            kv_bytes,
+            available_ram,
+            80 * 1024 * 1024u64,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1037,7 +1039,7 @@ fn test_tier1_us22_dual_gate_safe_gc_flock_and_maps() {
 
     // Gate 1: Check flock
     let gate1_passed = true; // no worker holds LOCK_SH
-                             // Gate 2: Check /proc/*/maps
+    // Gate 2: Check /proc/*/maps
     let gate2_passed = true; // no worker maps the file
 
     if gate1_passed && gate2_passed {

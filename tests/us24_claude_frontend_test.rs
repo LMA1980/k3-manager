@@ -229,7 +229,9 @@ async fn test_us24_claude_tool_use_content_block_passthrough() {
     let req_non_stream = ClaudeMessageRequest {
         model: "claude-tools-model".to_owned(),
         system: None,
-        messages: vec![ClaudeMessage::user("Please get the weather in San Francisco")],
+        messages: vec![ClaudeMessage::user(
+            "Please get the weather in San Francisco",
+        )],
         max_tokens: 512,
         thinking: None,
         tools: Some(tools.clone()),
@@ -321,8 +323,7 @@ async fn test_us24_claude_context_length_exceeded_returns_400() {
         })
         .expect("apply tuning profile");
 
-    let long_prompt =
-        "This is an excessively long prompt designed to exceed the strict 10 tokens context bound for testing context overflow.";
+    let long_prompt = "This is an excessively long prompt designed to exceed the strict 10 tokens context bound for testing context overflow.";
     let req = ClaudeMessageRequest {
         model: "claude-small-ctx".to_owned(),
         system: None,

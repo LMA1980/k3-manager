@@ -63,10 +63,16 @@ impl Drop for TempStoreDir {
     }
 }
 
-fn setup_cas_store() -> (ContentAddressedStore, Arc<DuckDbPersistenceStore>, TempStoreDir) {
+fn setup_cas_store() -> (
+    ContentAddressedStore,
+    Arc<DuckDbPersistenceStore>,
+    TempStoreDir,
+) {
     let temp_dir = TempStoreDir::new("k3_m1_chal2");
-    let catalog = Arc::new(DuckDbPersistenceStore::open_in_memory().expect("open duckdb in memory"));
-    let store = ContentAddressedStore::open(temp_dir.path(), catalog.clone()).expect("open CAS store");
+    let catalog =
+        Arc::new(DuckDbPersistenceStore::open_in_memory().expect("open duckdb in memory"));
+    let store =
+        ContentAddressedStore::open(temp_dir.path(), catalog.clone()).expect("open CAS store");
     (store, catalog, temp_dir)
 }
 
@@ -102,7 +108,9 @@ fn register_dummy_manifest(
         weight_size_bytes: 1024,
         created_at: 1000,
     };
-    store.register_manifest(&manifest).expect("register manifest")
+    store
+        .register_manifest(&manifest)
+        .expect("register manifest")
 }
 
 // ============================================================================
@@ -173,7 +181,9 @@ fn test_duckdb_cas_catalog_exhaustive_sql_injection() {
             "save_manifest must handle injection payload safely"
         );
 
-        let got_man = catalog.get_manifest(&manifest_digest).expect("get_manifest");
+        let got_man = catalog
+            .get_manifest(&manifest_digest)
+            .expect("get_manifest");
         assert!(got_man.is_some());
         assert_eq!(got_man.as_ref().unwrap().architecture_id, *attack);
 
@@ -236,7 +246,11 @@ fn test_duckdb_cas_catalog_exhaustive_sql_injection() {
         assert!(got_derived.is_some());
         assert_eq!(got_derived.unwrap().recipe_version, *attack);
 
-        assert!(catalog.update_derived_status(&derived_digest, "stale").is_ok());
+        assert!(
+            catalog
+                .update_derived_status(&derived_digest, "stale")
+                .is_ok()
+        );
 
         // E. Blob references with injection strings
         let ref_id = format!("ref_{idx}_{attack}");
@@ -248,7 +262,9 @@ fn test_duckdb_cas_catalog_exhaustive_sql_injection() {
             created_at: 100,
         };
         assert!(catalog.add_blob_reference(&ref_rec).is_ok());
-        let refs = catalog.list_blob_references(&blob_rec.digest).expect("list_blob_references");
+        let refs = catalog
+            .list_blob_references(&blob_rec.digest)
+            .expect("list_blob_references");
         assert!(!refs.is_empty());
         assert!(catalog.remove_blob_reference(&ref_id).expect("remove ref"));
 
@@ -260,10 +276,26 @@ fn test_duckdb_cas_catalog_exhaustive_sql_injection() {
 
         // G. Clean up created test entities
         assert!(catalog.delete_alias(&alias_id).expect("delete alias"));
-        assert!(catalog.delete_manifest(&manifest_digest).expect("delete manifest"));
-        assert!(catalog.delete_derived_blob(&derived_digest).expect("delete derived"));
-        assert!(catalog.delete_blob(&derived_digest).expect("delete derived blob"));
-        assert!(catalog.delete_blob(&blob_rec.digest).expect("delete base blob"));
+        assert!(
+            catalog
+                .delete_manifest(&manifest_digest)
+                .expect("delete manifest")
+        );
+        assert!(
+            catalog
+                .delete_derived_blob(&derived_digest)
+                .expect("delete derived")
+        );
+        assert!(
+            catalog
+                .delete_blob(&derived_digest)
+                .expect("delete derived blob")
+        );
+        assert!(
+            catalog
+                .delete_blob(&blob_rec.digest)
+                .expect("delete base blob")
+        );
     }
 
     // Crucial check: verify all tables still exist, are intact, and can be queried normally
@@ -332,7 +364,9 @@ fn test_duckdb_concurrent_alias_registration_and_ref_count_invariants() {
 
     // Verify all aliases are resolvable
     for alias in &all_created_aliases {
-        let resolved = store.resolve_alias(&alias.alias_id).expect("resolve created alias");
+        let resolved = store
+            .resolve_alias(&alias.alias_id)
+            .expect("resolve created alias");
         assert_eq!(resolved.weight_path, store.blobs_dir().join(&weight_digest));
         assert!(resolved.weight_path.exists());
     }
@@ -358,7 +392,10 @@ fn test_duckdb_concurrent_alias_registration_and_ref_count_invariants() {
     let remove_count = to_remove.len();
 
     let mut remove_handles = Vec::new();
-    let to_remove_chunks: Vec<_> = to_remove.chunks(aliases_per_thread.max(1)).map(|c| c.to_vec()).collect();
+    let to_remove_chunks: Vec<_> = to_remove
+        .chunks(aliases_per_thread.max(1))
+        .map(|c| c.to_vec())
+        .collect();
 
     for chunk in to_remove_chunks {
         let catalog_clone = catalog.clone();
@@ -416,7 +453,7 @@ fn test_capability_filtering_uncompiled_recipes_and_revisions() {
         ("qwen3", "2.0.0", "Q4_K_M"),
         ("llama", "0.1.0", "Q4_K_M"),
         ("llama", "3.0.0", "Q4_K_M"),
-        ("", "1.0.0", "Q4_K_M"),          // empty architecture
+        ("", "1.0.0", "Q4_K_M"), // empty architecture
         ("unknown_architecture_xyz", "1.0.0", "Q4_K_M"),
     ];
 
@@ -430,7 +467,8 @@ fn test_capability_filtering_uncompiled_recipes_and_revisions() {
             context_length: 2048,
             license: None,
             origin: None,
-            weight_digest: "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            weight_digest: "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_owned(),
             weight_size_bytes: 1024,
             created_at: 100,
         };
@@ -476,10 +514,10 @@ fn test_capability_filtering_invalid_quants_and_formats() {
         ("qwen3", "1.0.0", "IQ1_S"),
         ("qwen3", "1.0.0", "EXL2"),
         ("qwen3", "1.0.0", "INT4_AWQ"),
-        ("qwen3", "1.0.0", "Q8_0"),      // qwen3 compiled only supports Q4_K_M, F32, F16, BF16
+        ("qwen3", "1.0.0", "Q8_0"), // qwen3 compiled only supports Q4_K_M, F32, F16, BF16
         ("llama", "1.0.0", "Q3_K_M"),
         ("synthetic", "1.0.0", "Q5_K_M"),
-        ("synthetic", "1.0.0", ""),      // empty quant string
+        ("synthetic", "1.0.0", ""), // empty quant string
         ("synthetic", "1.0.0", "UNKNOWN_QUANT_XYZ"),
     ];
 
@@ -493,7 +531,8 @@ fn test_capability_filtering_invalid_quants_and_formats() {
             context_length: 2048,
             license: None,
             origin: None,
-            weight_digest: "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+            weight_digest: "2222222222222222222222222222222222222222222222222222222222222222"
+                .to_owned(),
             weight_size_bytes: 1024,
             created_at: 100,
         };
@@ -511,7 +550,15 @@ fn test_capability_filtering_invalid_quants_and_formats() {
     }
 
     // Invalid format test cases (e.g. onnx, pt, torchscript)
-    let invalid_formats = ["onnx", "pt", "torchscript", "bin", "h5", "", "unknown_format"];
+    let invalid_formats = [
+        "onnx",
+        "pt",
+        "torchscript",
+        "bin",
+        "h5",
+        "",
+        "unknown_format",
+    ];
     for fmt in invalid_formats {
         let manifest = ModelManifest {
             schema_version: 1,
@@ -522,7 +569,8 @@ fn test_capability_filtering_invalid_quants_and_formats() {
             context_length: 2048,
             license: None,
             origin: None,
-            weight_digest: "3333333333333333333333333333333333333333333333333333333333333333".to_owned(),
+            weight_digest: "3333333333333333333333333333333333333333333333333333333333333333"
+                .to_owned(),
             weight_size_bytes: 1024,
             created_at: 100,
         };
@@ -543,14 +591,20 @@ fn test_capability_filtering_invalid_quants_and_formats() {
         context_length: 0, // Invalid!
         license: None,
         origin: None,
-        weight_digest: "4444444444444444444444444444444444444444444444444444444444444444".to_owned(),
+        weight_digest: "4444444444444444444444444444444444444444444444444444444444444444"
+            .to_owned(),
         weight_size_bytes: 1024,
         created_at: 100,
     };
 
     let eval_zero = CapabilityFilter::evaluate_candidate(&zero_ctx_manifest);
     assert!(!eval_zero.executable);
-    assert!(eval_zero.reason.unwrap().contains("context length must be greater than 0"));
+    assert!(
+        eval_zero
+            .reason
+            .unwrap()
+            .contains("context length must be greater than 0")
+    );
 
     let err_zero = CapabilityFilter::validate_model_manifest(&zero_ctx_manifest)
         .expect_err("zero context length must fail upfront");
@@ -561,7 +615,11 @@ fn test_capability_filtering_invalid_quants_and_formats() {
 #[test]
 fn test_capability_filtering_tokenizer_alignment_and_stop_sequences() {
     // Test aligned prompt environments across compiled recipes
-    let compiled = [("synthetic", "1.0.0"), ("qwen3", "1.0.0"), ("llama", "1.0.0")];
+    let compiled = [
+        ("synthetic", "1.0.0"),
+        ("qwen3", "1.0.0"),
+        ("llama", "1.0.0"),
+    ];
 
     for (arch, ver) in compiled {
         let env = CapabilityFilter::align_prompt_environment(arch, ver)
@@ -583,7 +641,9 @@ fn test_capability_filtering_tokenizer_alignment_and_stop_sequences() {
         }
 
         // Format and tokenize within bounds
-        let tokens = env.format_and_tokenize(&tokenizer, prompt, 1024).expect("tokenize");
+        let tokens = env
+            .format_and_tokenize(&tokenizer, prompt, 1024)
+            .expect("tokenize");
         assert!(!tokens.is_empty());
 
         // Format and tokenize exceeding bounds returns ContextLengthExceeded
@@ -647,18 +707,27 @@ fn test_derived_weights_cache_concurrency_and_deduplication() {
             .unwrap_or_else(|e| panic!("thread {t_idx} failed: {e}"));
 
         let digest = match res {
-            DerivedResolution::Created { derived_digest, derived_path } => {
+            DerivedResolution::Created {
+                derived_digest,
+                derived_path,
+            } => {
                 assert!(derived_path.exists());
                 derived_digest
             }
-            DerivedResolution::Cached { derived_digest, derived_path } => {
+            DerivedResolution::Cached {
+                derived_digest,
+                derived_path,
+            } => {
                 assert!(derived_path.exists());
                 derived_digest
             }
         };
 
         if let Some(ref fd) = first_digest {
-            assert_eq!(fd, &digest, "all threads must receive identical derived digest");
+            assert_eq!(
+                fd, &digest,
+                "all threads must receive identical derived digest"
+            );
         } else {
             first_digest = Some(digest);
         }
@@ -666,7 +735,11 @@ fn test_derived_weights_cache_concurrency_and_deduplication() {
 
     // Exactly 2 blobs on disk: 1 source + 1 derived
     let files: Vec<_> = fs::read_dir(store.blobs_dir()).unwrap().flatten().collect();
-    assert_eq!(files.len(), 2, "no duplicate derived blobs should be created on disk");
+    assert_eq!(
+        files.len(),
+        2,
+        "no duplicate derived blobs should be created on disk"
+    );
 }
 
 #[test]
@@ -697,7 +770,9 @@ fn test_derived_weights_retention_policies_edge_cases() {
     assert!(matches!(res_imm, DerivedResolution::Created { .. }));
 
     // Storage config must have purge_immediate recorded
-    let cfg = catalog.get_storage_config(&format!("purge_immediate:{digest_1}")).unwrap();
+    let cfg = catalog
+        .get_storage_config(&format!("purge_immediate:{digest_1}"))
+        .unwrap();
     assert_eq!(cfg, Some("true".to_owned()));
 
     // ref_count decremented from 1 to 0
@@ -722,7 +797,9 @@ fn test_derived_weights_retention_policies_edge_cases() {
         .expect("derive with delay 0");
     assert!(matches!(res_delay_zero, DerivedResolution::Created { .. }));
 
-    let cfg_delay_zero = catalog.get_storage_config(&format!("purge_after:{digest_2}")).unwrap();
+    let cfg_delay_zero = catalog
+        .get_storage_config(&format!("purge_after:{digest_2}"))
+        .unwrap();
     assert!(cfg_delay_zero.is_some());
     let ts: u64 = cfg_delay_zero.unwrap().parse().unwrap();
     assert!(ts > 0);
@@ -736,7 +813,9 @@ fn test_derived_weights_retention_policies_edge_cases() {
             &digest_3,
             "1.0.0",
             "ime_tile_8x16",
-            RetentionPolicy::PurgeAfterDelay { delay_secs: 31_536_000 },
+            RetentionPolicy::PurgeAfterDelay {
+                delay_secs: 31_536_000,
+            },
             |_src, dst| {
                 fs::write(dst, b"tiled_3").unwrap();
                 Ok(7)
@@ -745,7 +824,9 @@ fn test_derived_weights_retention_policies_edge_cases() {
         .expect("derive with delay 31536000");
     assert!(matches!(res_delay_large, DerivedResolution::Created { .. }));
 
-    let cfg_delay_large = catalog.get_storage_config(&format!("purge_after:{digest_3}")).unwrap();
+    let cfg_delay_large = catalog
+        .get_storage_config(&format!("purge_after:{digest_3}"))
+        .unwrap();
     assert!(cfg_delay_large.is_some());
     let ts_large: u64 = cfg_delay_large.unwrap().parse().unwrap();
     assert!(ts_large > ts);
@@ -784,7 +865,10 @@ fn test_stale_recipe_detection_auto_rebuild_and_advisory() {
         )
         .expect("check up-to-date");
 
-    assert!(matches!(outcome_uptodate, StaleRecipeOutcome::UpToDate { .. }));
+    assert!(matches!(
+        outcome_uptodate,
+        StaleRecipeOutcome::UpToDate { .. }
+    ));
 
     // 3. Upgraded runtime with active recipe "2.0.0", source weights present -> Rebuilt
     let mut rebuild_called = false;
@@ -804,9 +888,15 @@ fn test_stale_recipe_detection_auto_rebuild_and_advisory() {
 
     assert!(rebuild_called, "rebuilder must have been executed");
     match outcome_rebuild {
-        StaleRecipeOutcome::Rebuilt { new_derived_digest, new_derived_path } => {
+        StaleRecipeOutcome::Rebuilt {
+            new_derived_digest,
+            new_derived_path,
+        } => {
             assert!(new_derived_path.exists());
-            assert_eq!(new_derived_digest, Sha256::digest(b"derived_v2_rebuilt_bytes"));
+            assert_eq!(
+                new_derived_digest,
+                Sha256::digest(b"derived_v2_rebuilt_bytes")
+            );
         }
         _ => panic!("expected StaleRecipeOutcome::Rebuilt"),
     }
@@ -814,8 +904,14 @@ fn test_stale_recipe_detection_auto_rebuild_and_advisory() {
     // Verify DuckDB catalog now has "stale" on v1 and "valid" on v2
     let derived_list = catalog.list_derived_for_source(&source_digest).unwrap();
     assert_eq!(derived_list.len(), 2);
-    let v1 = derived_list.iter().find(|d| d.recipe_version == "1.0.0").unwrap();
-    let v2 = derived_list.iter().find(|d| d.recipe_version == "2.0.0").unwrap();
+    let v1 = derived_list
+        .iter()
+        .find(|d| d.recipe_version == "1.0.0")
+        .unwrap();
+    let v2 = derived_list
+        .iter()
+        .find(|d| d.recipe_version == "2.0.0")
+        .unwrap();
     assert_eq!(v1.status, "stale");
     assert_eq!(v2.status, "valid");
 
@@ -917,8 +1013,14 @@ fn test_derived_memory_admission_limits() {
     )
     .expect_err("must reject when exceeding memlock limit");
 
-    assert!(matches!(err_memlock, K3Error::InsufficientLockableMemory { .. }));
-    assert_eq!(err_memlock.diagnostic_code(), "insufficient_lockable_memory");
+    assert!(matches!(
+        err_memlock,
+        K3Error::InsufficientLockableMemory { .. }
+    ));
+    assert_eq!(
+        err_memlock.diagnostic_code(),
+        "insufficient_lockable_memory"
+    );
 
     // Case 3: Exceeding available RAM
     let tight_ram = 16 * 1024 * 1024 * 1024;
@@ -931,7 +1033,10 @@ fn test_derived_memory_admission_limits() {
     )
     .expect_err("must reject when exceeding available RAM");
 
-    assert!(matches!(err_ram, K3Error::InsufficientLockableMemory { .. }));
+    assert!(matches!(
+        err_ram,
+        K3Error::InsufficientLockableMemory { .. }
+    ));
 }
 
 #[test]
@@ -945,7 +1050,9 @@ fn test_alias_creation_nonexistent_manifest_and_duplicate_alias() {
         .expect_err("nonexistent manifest must be rejected");
 
     assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
-    assert!(err.to_string().contains("manifest 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' not found"));
+    assert!(err.to_string().contains(
+        "manifest 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' not found"
+    ));
 
     // 2. Duplicate alias registration updates/idempotently replaces the existing alias
     let (weight_digest, _) = register_dummy_blob(&store, b"weight_payload_alias_dup");
@@ -963,7 +1070,9 @@ fn test_alias_creation_nonexistent_manifest_and_duplicate_alias() {
     assert_eq!(alias1.alias_id, alias2.alias_id);
 
     // Verify resolve_alias works cleanly
-    let resolved = store.resolve_alias("local/ns/model/v1").expect("resolve alias");
+    let resolved = store
+        .resolve_alias("local/ns/model/v1")
+        .expect("resolve alias");
     assert_eq!(resolved.weight_path, store.blobs_dir().join(&weight_digest));
 
     // Ref count should remain consistent (manifest ref + alias ref = 2)
@@ -992,7 +1101,10 @@ fn test_derived_weights_missing_source_and_multi_target_isolation() {
         .expect_err("missing source weights must be rejected");
 
     assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
-    assert!(err.to_string().contains("not found in store; cannot derive layout"));
+    assert!(
+        err.to_string()
+            .contains("not found in store; cannot derive layout")
+    );
 
     // 2. Multi-target layout isolation on same source weights
     let source_content = b"original_source_for_multi_layout_testing";
@@ -1035,11 +1147,20 @@ fn test_derived_weights_missing_source_and_multi_target_isolation() {
         _ => panic!("expected Created"),
     };
 
-    assert_ne!(digest_a, digest_b, "different target layouts must produce distinct blobs");
+    assert_ne!(
+        digest_a, digest_b,
+        "different target layouts must produce distinct blobs"
+    );
 
     // Query both layouts independently from catalog
-    let record_a = catalog.get_derived_blob(&source_digest, "1.0.0", "ime_tile_8x16").unwrap().unwrap();
-    let record_b = catalog.get_derived_blob(&source_digest, "1.0.0", "native").unwrap().unwrap();
+    let record_a = catalog
+        .get_derived_blob(&source_digest, "1.0.0", "ime_tile_8x16")
+        .unwrap()
+        .unwrap();
+    let record_b = catalog
+        .get_derived_blob(&source_digest, "1.0.0", "native")
+        .unwrap()
+        .unwrap();
     assert_eq!(record_a.derived_digest, digest_a);
     assert_eq!(record_b.derived_digest, digest_b);
 
@@ -1063,7 +1184,10 @@ fn test_derived_weights_missing_source_and_multi_target_isolation() {
     assert!(matches!(outcome, StaleRecipeOutcome::Rebuilt { .. }));
 
     // Verify layout B is still valid and unchanged
-    let record_b_after = catalog.get_derived_blob(&source_digest, "1.0.0", "native").unwrap().unwrap();
+    let record_b_after = catalog
+        .get_derived_blob(&source_digest, "1.0.0", "native")
+        .unwrap()
+        .unwrap();
     assert_eq!(record_b_after.status, "valid");
     assert_eq!(record_b_after.recipe_version, "1.0.0");
 }
@@ -1084,10 +1208,18 @@ fn test_cas_catalog_extreme_accounting_and_blob_sizes() {
     };
     catalog.save_blob(&blob_huge).unwrap();
 
-    let fetched = catalog.get_blob("huge_model_digest_140gib").unwrap().unwrap();
-    assert_eq!(fetched.size_bytes, huge_size, "u64 sizes must not truncate in DuckDB");
+    let fetched = catalog
+        .get_blob("huge_model_digest_140gib")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fetched.size_bytes, huge_size,
+        "u64 sizes must not truncate in DuckDB"
+    );
 
     let total = catalog.total_blob_bytes().unwrap();
-    assert!(total >= huge_size, "total_blob_bytes must handle 64-bit sums correctly");
+    assert!(
+        total >= huge_size,
+        "total_blob_bytes must handle 64-bit sums correctly"
+    );
 }
-

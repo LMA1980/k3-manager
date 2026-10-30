@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use k3_manager::persistence::DuckDbPersistenceStore;
-use k3_manager::store::{
-    ContentAddressedStore, ENV_STORE_ROOT, ModelManifest, Sha256,
-};
+use k3_manager::store::{ContentAddressedStore, ENV_STORE_ROOT, ModelManifest, Sha256};
 
 static GLOBAL_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -199,9 +197,17 @@ fn test_scenario2_configurable_store_root_location() {
 
     assert_eq!(store.root(), custom_secondary_nvme.path());
     assert!(store.blobs_dir().starts_with(custom_secondary_nvme.path()));
-    assert!(store.manifests_dir().starts_with(custom_secondary_nvme.path()));
+    assert!(
+        store
+            .manifests_dir()
+            .starts_with(custom_secondary_nvme.path())
+    );
     assert!(store.models_dir().starts_with(custom_secondary_nvme.path()));
-    assert!(store.staging_dir().starts_with(custom_secondary_nvme.path()));
+    assert!(
+        store
+            .staging_dir()
+            .starts_with(custom_secondary_nvme.path())
+    );
 
     // Verify all file operations happen exclusively under the configured secondary volume
     let (staging, mut f) = store.create_staging_file().expect("staging file");
@@ -234,7 +240,9 @@ fn test_scenario3_human_browsable_model_inspection() {
     f.write_all(&payload).expect("write");
     drop(f);
 
-    store.promote_staged_blob(&staging, &digest, "gguf").expect("promote");
+    store
+        .promote_staged_blob(&staging, &digest, "gguf")
+        .expect("promote");
 
     let manifest = ModelManifest {
         schema_version: 1,
@@ -272,7 +280,10 @@ fn test_scenario3_human_browsable_model_inspection() {
 
     let manifest_symlink = alias_dir.join("manifest.json");
     let weights_symlink = alias_dir.join("weights");
-    assert!(manifest_symlink.exists(), "manifest.json symlink must exist");
+    assert!(
+        manifest_symlink.exists(),
+        "manifest.json symlink must exist"
+    );
     assert!(weights_symlink.exists(), "weights symlink must exist");
 
     // 2. Verify relative symlink resolution
@@ -282,11 +293,15 @@ fn test_scenario3_human_browsable_model_inspection() {
         let weights_target = fs::read_link(&weights_symlink).expect("read weights link");
 
         assert!(
-            manifest_target.to_string_lossy().starts_with("../../../../../manifests/sha256/"),
+            manifest_target
+                .to_string_lossy()
+                .starts_with("../../../../../manifests/sha256/"),
             "manifest symlink must use relative path pointing inward"
         );
         assert!(
-            weights_target.to_string_lossy().starts_with("../../../../../blobs/sha256/"),
+            weights_target
+                .to_string_lossy()
+                .starts_with("../../../../../blobs/sha256/"),
             "weights symlink must use relative path pointing inward"
         );
     }

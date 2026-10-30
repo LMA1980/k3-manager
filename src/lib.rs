@@ -30,10 +30,10 @@ pub use flight::{
     flight_tensor_schema,
 };
 pub use ingestion::{
-    AuthStatus, GgufHeaderPrefix, HuggingFaceAdapter, IngestionError, LocalFileAdapter, ModelFormat,
-    ModelRevision, ModelVersionListing, OllamaAdapter, PullArtifactSummary, PullProgress,
-    PullRequest, RemoteModelSummary, SafeTensorsHeaderPrefix, SearchFilter, SourceAdapter,
-    SourceAdapterRegistry, SourceCredentials, StagingDownload, StagingPipeline,
+    AuthStatus, GgufHeaderPrefix, HuggingFaceAdapter, IngestionError, LocalFileAdapter,
+    ModelFormat, ModelRevision, ModelVersionListing, OllamaAdapter, PullArtifactSummary,
+    PullProgress, PullRequest, RemoteModelSummary, SafeTensorsHeaderPrefix, SearchFilter,
+    SourceAdapter, SourceAdapterRegistry, SourceCredentials, StagingDownload, StagingPipeline,
 };
 
 pub use store::{

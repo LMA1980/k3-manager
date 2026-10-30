@@ -198,7 +198,9 @@ impl ProtocolServer {
             }
 
             let Some(end_idx) = header_end_idx else {
-                return Err(ServerError::BadRequest("Incomplete HTTP headers".to_owned()));
+                return Err(ServerError::BadRequest(
+                    "Incomplete HTTP headers".to_owned(),
+                ));
             };
 
             let header_bytes = &header_buf[..end_idx];
@@ -293,7 +295,11 @@ impl ProtocolServer {
     }
 
     /// Serializes and writes an HTTP response frame to an async stream.
-    async fn write_http_response<S>(&self, stream: &mut S, resp: HttpResponse) -> Result<(), ServerError>
+    async fn write_http_response<S>(
+        &self,
+        stream: &mut S,
+        resp: HttpResponse,
+    ) -> Result<(), ServerError>
     where
         S: AsyncWrite + Unpin,
     {

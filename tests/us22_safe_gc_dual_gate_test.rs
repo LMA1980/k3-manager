@@ -5,6 +5,8 @@
 //! - Scenario 2: High-water mark warning without unapproved automatic blob deletion.
 //! - Scenario 3: Dual-gate safety check (Gate 1 flock + Gate 2 maps scan) preventing deletion of mapped blobs (online or offline).
 
+#![allow(clippy::too_many_lines)]
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -53,10 +55,8 @@ fn create_store_and_gc() -> (
     let catalog = DuckDbPersistenceStore::open_in_memory().expect("open catalog");
     let catalog_arc: Arc<dyn CasCatalog> = Arc::new(catalog);
 
-    let store = Arc::new(
-        ContentAddressedStore::open(temp_dir.path(), catalog_arc)
-            .expect("open store"),
-    );
+    let store =
+        Arc::new(ContentAddressedStore::open(temp_dir.path(), catalog_arc).expect("open store"));
 
     let mock_scanner = Arc::new(MockProcMapsScanner::new());
     let gc = StorageGarbageCollector::with_scanner(
@@ -88,7 +88,9 @@ fn test_scenario1_reference_counted_manifest_removal_without_blob_destruction() 
     let (staging, mut f) = store.create_staging_file().expect("staging");
     f.write_all(&payload).expect("write");
     drop(f);
-    store.promote_staged_blob(&staging, &digest, "gguf").expect("promote");
+    store
+        .promote_staged_blob(&staging, &digest, "gguf")
+        .expect("promote");
 
     // Tag 1: v1.0
     let man1 = ModelManifest {
@@ -106,7 +108,13 @@ fn test_scenario1_reference_counted_manifest_removal_without_blob_destruction() 
     };
     let man_rec1 = store.register_manifest(&man1).expect("man1");
     store
-        .create_alias("local", "team", "model-x", "v1.0", &man_rec1.manifest_digest)
+        .create_alias(
+            "local",
+            "team",
+            "model-x",
+            "v1.0",
+            &man_rec1.manifest_digest,
+        )
         .expect("alias1");
 
     // Tag 2: v1.1
@@ -125,7 +133,13 @@ fn test_scenario1_reference_counted_manifest_removal_without_blob_destruction() 
     };
     let man_rec2 = store.register_manifest(&man2).expect("man2");
     store
-        .create_alias("local", "team", "model-x", "v1.1", &man_rec2.manifest_digest)
+        .create_alias(
+            "local",
+            "team",
+            "model-x",
+            "v1.1",
+            &man_rec2.manifest_digest,
+        )
         .expect("alias2");
 
     let blob_before = store.catalog().get_blob(&digest).unwrap().unwrap();
@@ -138,13 +152,20 @@ fn test_scenario1_reference_counted_manifest_removal_without_blob_destruction() 
     assert!(removed);
 
     // Assert manifest 1 and alias 1 are gone
-    let alias1_opt = store.catalog().get_alias("local/team/model-x/v1.0").unwrap();
+    let alias1_opt = store
+        .catalog()
+        .get_alias("local/team/model-x/v1.0")
+        .unwrap();
     assert!(alias1_opt.is_none());
     assert!(!store.models_dir().join("local/team/model-x/v1.0").exists());
 
     // Run garbage collection
     let gc_report = gc.run_gc(false).expect("run gc");
-    assert_eq!(gc_report.reclaimed_blobs.len(), 0, "shared blob must not be deleted");
+    assert_eq!(
+        gc_report.reclaimed_blobs.len(),
+        0,
+        "shared blob must not be deleted"
+    );
 
     // 3. Shared weight blob remains intact on storage for Tag 2 (v1.1)
     let weight_blob_path = store.blobs_dir().join(&digest);
@@ -178,7 +199,9 @@ fn test_scenario2_high_water_mark_warning_without_auto_deletion() {
     let (staging, mut f) = store.create_staging_file().expect("staging");
     f.write_all(&payload).expect("write");
     drop(f);
-    store.promote_staged_blob(&staging, &digest, "gguf").expect("promote");
+    store
+        .promote_staged_blob(&staging, &digest, "gguf")
+        .expect("promote");
 
     // 1. Check watermark: emits operational warning
     let warning_opt = gc.check_watermark().expect("check watermark");
@@ -187,7 +210,11 @@ fn test_scenario2_high_water_mark_warning_without_auto_deletion() {
     assert_eq!(warning.threshold_bytes, threshold);
     assert!(warning.current_bytes >= 8000);
     assert!(warning.usage_ratio > 1.0);
-    assert!(warning.warning_message.contains("exceeds configured high-water mark"));
+    assert!(
+        warning
+            .warning_message
+            .contains("exceeds configured high-water mark")
+    );
 
     // 2. Crucial Invariant: The system NEVER automatically deletes model blobs on watermark crossing
     let blob_path = store.blobs_dir().join(&digest);
@@ -207,7 +234,9 @@ fn test_scenario3_dual_gate_safety_check_online_or_offline() {
     let (staging, mut f) = store.create_staging_file().expect("staging");
     f.write_all(&payload).expect("write");
     drop(f);
-    let blob_path = store.promote_staged_blob(&staging, &digest, "gguf").expect("promote");
+    let blob_path = store
+        .promote_staged_blob(&staging, &digest, "gguf")
+        .expect("promote");
 
     let manifest = ModelManifest {
         schema_version: 1,
@@ -224,7 +253,13 @@ fn test_scenario3_dual_gate_safety_check_online_or_offline() {
     };
     let man_rec = store.register_manifest(&manifest).expect("manifest");
     store
-        .create_alias("local", "app", "worker-model", "active", &man_rec.manifest_digest)
+        .create_alias(
+            "local",
+            "app",
+            "worker-model",
+            "active",
+            &man_rec.manifest_digest,
+        )
         .expect("alias");
 
     // Manifest removed by operator: alias unlinked, ref_count decrements to 0
@@ -233,7 +268,10 @@ fn test_scenario3_dual_gate_safety_check_online_or_offline() {
         .expect("remove alias");
     assert!(removed);
 
-    let unreferenced = store.catalog().list_unreferenced_blobs().expect("unreferenced");
+    let unreferenced = store
+        .catalog()
+        .list_unreferenced_blobs()
+        .expect("unreferenced");
     assert_eq!(unreferenced.len(), 1);
     assert_eq!(unreferenced[0].digest, digest);
 
@@ -250,7 +288,10 @@ fn test_scenario3_dual_gate_safety_check_online_or_offline() {
 
         // Inspect who_uses query
         let usage = gc.who_uses(&digest).expect("who-uses query");
-        assert!(usage.gate1_shared_lock_held, "who-uses detects shared flock held");
+        assert!(
+            usage.gate1_shared_lock_held,
+            "who-uses detects shared flock held"
+        );
         assert!(usage.is_in_use(), "blob flagged as in-use");
 
         // GC runs while worker holds lock: must skip deleting
@@ -260,7 +301,10 @@ fn test_scenario3_dual_gate_safety_check_online_or_offline() {
             gc_report1.skipped_in_use_gate1.contains(&digest),
             "Gate 1 must skip blob held by active shared lock"
         );
-        assert!(blob_path.exists(), "blob must not be deleted while Gate 1 is locked");
+        assert!(
+            blob_path.exists(),
+            "blob must not be deleted while Gate 1 is locked"
+        );
 
         // Worker drops file and releases lock
         // SAFETY: Calling flock to release lock on valid open file descriptor
@@ -287,10 +331,17 @@ fn test_scenario3_dual_gate_safety_check_online_or_offline() {
         // Inspect who_uses query
         let usage2 = gc.who_uses(&digest).expect("who-uses query");
         assert!(!usage2.gate1_shared_lock_held, "flock is free");
-        assert_eq!(usage2.gate2_active_mappings.len(), 1, "Gate 2 detects active mapping");
+        assert_eq!(
+            usage2.gate2_active_mappings.len(),
+            1,
+            "Gate 2 detects active mapping"
+        );
         assert_eq!(usage2.gate2_active_mappings[0].pid, 4242);
         assert_eq!(usage2.gate2_active_mappings[0].comm, "k3-worker");
-        assert!(usage2.is_in_use(), "blob flagged in-use due to Gate 2 mapping");
+        assert!(
+            usage2.is_in_use(),
+            "blob flagged in-use due to Gate 2 mapping"
+        );
 
         // GC runs while memory mapping exists: must skip deleting
         let gc_report2 = gc.run_gc(false).expect("gc run 2");
@@ -299,7 +350,10 @@ fn test_scenario3_dual_gate_safety_check_online_or_offline() {
             gc_report2.skipped_mapped_gate2.contains(&digest),
             "Gate 2 must skip blob mapped in process virtual memory"
         );
-        assert!(blob_path.exists(), "blob must not be deleted while mapped in memory");
+        assert!(
+            blob_path.exists(),
+            "blob must not be deleted while mapped in memory"
+        );
 
         // Process exits: clear memory mapping
         mock_scanner.clear();

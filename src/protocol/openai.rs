@@ -14,8 +14,8 @@
     clippy::too_many_lines
 )]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use k3_core::error::K3Error;
@@ -120,7 +120,12 @@ impl OpenAiAdapter {
 
         // 3. Tokenize prompt & check context window bounds (ADR-027, US-23 Scenario 3)
         // Use runtime tokenizer if registered, otherwise fallback to whitespace/character approximation
-        let token_count = match runtime.dispatch_tokenize_prompt(&req.model, &prompt_text, true, n_ctx) {
+        let token_count = match runtime.dispatch_tokenize_prompt(
+            &req.model,
+            &prompt_text,
+            true,
+            n_ctx,
+        ) {
             Ok(tokens) => tokens.len(),
             Err(e) => {
                 // Check if context length was exceeded
@@ -363,7 +368,9 @@ impl OpenAiAdapter {
                 let _ = sse_sender.send("data: [DONE]\n\n".to_owned()).await;
 
                 // Notify admission queue execution completion
-                runtime_clone.queue_mgr().mark_execution_completed(&model_name);
+                runtime_clone
+                    .queue_mgr()
+                    .mark_execution_completed(&model_name);
             });
 
             HttpResponse::sse_stream(sse_rx)
@@ -573,7 +580,10 @@ impl OpenAiAdapter {
         let mut map = serde_json::Map::new();
 
         if let Some(params) = parameters {
-            if let Some(props) = params.get("properties").and_then(serde_json::Value::as_object) {
+            if let Some(props) = params
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
                 for (prop_name, prop_schema) in props {
                     let prop_type = prop_schema
                         .get("type")

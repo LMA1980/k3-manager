@@ -16,8 +16,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use k3_core::affinity::ControlPlaneCapacityConfig;
@@ -30,8 +30,8 @@ use k3_manager::persistence::{
     ModelBlobRecord, ModelManifestRecord, PersistenceStore, Project, SessionLastTurn, Tenant,
 };
 use k3_manager::protocol::{
-    ClaudeAdapter, HttpRequest, HttpResponseBody, OpenAiAdapter, ProtocolServer,
-    ProtocolServerConfig, ServerError, DEFAULT_MAX_REQUEST_BODY_BYTES, MAX_REQUEST_HEADERS_BYTES,
+    ClaudeAdapter, DEFAULT_MAX_REQUEST_BODY_BYTES, HttpRequest, HttpResponseBody,
+    MAX_REQUEST_HEADERS_BYTES, OpenAiAdapter, ProtocolServer, ProtocolServerConfig, ServerError,
 };
 use k3_manager::runtime::{AdminCommand, ControlPlaneRuntime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

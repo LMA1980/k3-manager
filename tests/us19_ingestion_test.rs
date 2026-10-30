@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use k3_manager::ingestion::{
-    AuthStatus, GgufHeaderPrefix, HuggingFaceAdapter, IngestionError, LocalFileAdapter, ModelFormat,
-    OllamaAdapter, PullRequest, SafeTensorsHeaderPrefix, SearchFilter, SourceAdapter,
+    AuthStatus, GgufHeaderPrefix, HuggingFaceAdapter, IngestionError, LocalFileAdapter,
+    ModelFormat, OllamaAdapter, PullRequest, SafeTensorsHeaderPrefix, SearchFilter, SourceAdapter,
     SourceAdapterRegistry, SourceCredentials, StagingPipeline,
 };
 use k3_manager::persistence::DuckDbPersistenceStore;
@@ -100,7 +100,10 @@ fn test_source_adapter_lifecycle_huggingface() {
     let creds = SourceCredentials::Token("hf_test_token_abcdef123456".to_owned());
     let auth_status = adapter.auth(&creds).unwrap();
     match auth_status {
-        AuthStatus::Authenticated { identity, permissions } => {
+        AuthStatus::Authenticated {
+            identity,
+            permissions,
+        } => {
             assert_eq!(identity, "hf_developer");
             assert!(permissions.contains(&"read".to_owned()));
         }
@@ -246,9 +249,15 @@ fn test_interrupted_download_staging_cleanup() {
     assert!(result.is_err(), "simulated network drop must return error");
 
     // Invariant: .part file unlinked immediately, blobs dir uncontaminated
-    assert!(!staging_path.exists(), "interrupted staging file must be unlinked");
+    assert!(
+        !staging_path.exists(),
+        "interrupted staging file must be unlinked"
+    );
     let blob_count = fs::read_dir(&blobs_dir).unwrap().count();
-    assert_eq!(blob_count, 0, "blobs directory must remain completely empty");
+    assert_eq!(
+        blob_count, 0,
+        "blobs directory must remain completely empty"
+    );
 }
 
 #[test]
@@ -307,7 +316,10 @@ fn test_zerocopy_format_header_verification() {
 
     let verify_res = StagingPipeline::verify_format_header(&corrupt_gguf_path, &ModelFormat::Gguf);
     assert!(verify_res.is_err());
-    assert!(!corrupt_gguf_path.exists(), "corrupted file must be unlinked");
+    assert!(
+        !corrupt_gguf_path.exists(),
+        "corrupted file must be unlinked"
+    );
 
     // 3. Valid SafeTensors passes
     let (valid_st_path, mut f3) = StagingPipeline::create_staging_file(&staging_dir).unwrap();
@@ -315,7 +327,9 @@ fn test_zerocopy_format_header_verification() {
     f3.write_all(&st_bytes).unwrap();
     drop(f3);
 
-    assert!(StagingPipeline::verify_format_header(&valid_st_path, &ModelFormat::SafeTensors).is_ok());
+    assert!(
+        StagingPipeline::verify_format_header(&valid_st_path, &ModelFormat::SafeTensors).is_ok()
+    );
 
     // 4. Corrupted SafeTensors length rejected and unlinked
     let (corrupt_st_path, mut f4) = StagingPipeline::create_staging_file(&staging_dir).unwrap();
@@ -323,9 +337,13 @@ fn test_zerocopy_format_header_verification() {
     f4.write_all(b"not_valid_json").unwrap();
     drop(f4);
 
-    let verify_st_res = StagingPipeline::verify_format_header(&corrupt_st_path, &ModelFormat::SafeTensors);
+    let verify_st_res =
+        StagingPipeline::verify_format_header(&corrupt_st_path, &ModelFormat::SafeTensors);
     assert!(verify_st_res.is_err());
-    assert!(!corrupt_st_path.exists(), "corrupted SafeTensors file must be unlinked");
+    assert!(
+        !corrupt_st_path.exists(),
+        "corrupted SafeTensors file must be unlinked"
+    );
 }
 
 #[test]
@@ -335,7 +353,8 @@ fn test_atomic_promotion_and_deduplication() {
     let pipeline = StagingPipeline::new(store_root);
 
     let db_path = store_root.join("catalog.duckdb");
-    let catalog = Arc::new(DuckDbPersistenceStore::open(&db_path).unwrap()) as Arc<dyn k3_manager::persistence::CasCatalog>;
+    let catalog = Arc::new(DuckDbPersistenceStore::open(&db_path).unwrap())
+        as Arc<dyn k3_manager::persistence::CasCatalog>;
 
     let payload = create_valid_gguf_payload("dedup_model");
     let digest = Sha256::digest(&payload);
@@ -343,7 +362,12 @@ fn test_atomic_promotion_and_deduplication() {
     // Run 1: First promotion creates blob
     let mut cursor1 = Cursor::new(payload.clone());
     let download1 = pipeline
-        .ingest_and_promote(&mut cursor1, Some(&digest), ModelFormat::Gguf, Some(&catalog))
+        .ingest_and_promote(
+            &mut cursor1,
+            Some(&digest),
+            ModelFormat::Gguf,
+            Some(&catalog),
+        )
         .unwrap();
 
     assert!(download1.staging_path.exists());
@@ -357,11 +381,15 @@ fn test_atomic_promotion_and_deduplication() {
         assert_eq!(perms.mode() & 0o777, 0o444);
     }
 
-    let blob_rec1 = catalog.get_blob(&digest).unwrap().expect("blob must be in catalog");
+    let blob_rec1 = catalog
+        .get_blob(&digest)
+        .unwrap()
+        .expect("blob must be in catalog");
     assert_eq!(blob_rec1.ref_count, 1);
 
     // Run 2: Second promotion of identical weights (Deduplication)
-    let (part_path2, mut f2) = StagingPipeline::create_staging_file(&pipeline.staging_dir()).unwrap();
+    let (part_path2, mut f2) =
+        StagingPipeline::create_staging_file(&pipeline.staging_dir()).unwrap();
     f2.write_all(&payload).unwrap();
     drop(f2);
 
@@ -375,10 +403,16 @@ fn test_atomic_promotion_and_deduplication() {
 
     // Promoted path matches first path, part_path2 unlinked
     assert_eq!(promoted_path2, download1.staging_path);
-    assert!(!part_path2.exists(), "staged part file must be unlinked after dedup");
+    assert!(
+        !part_path2.exists(),
+        "staged part file must be unlinked after dedup"
+    );
 
     let blob_rec2 = catalog.get_blob(&digest).unwrap().unwrap();
-    assert_eq!(blob_rec2.ref_count, 2, "catalog ref_count must be incremented on dedup");
+    assert_eq!(
+        blob_rec2.ref_count, 2,
+        "catalog ref_count must be incremented on dedup"
+    );
 }
 
 #[test]
@@ -386,11 +420,15 @@ fn test_source_adapter_registry_and_providers() {
     let registry = SourceAdapterRegistry::with_defaults();
 
     // Lookup Hugging Face adapter
-    let hf = registry.get_adapter("huggingface").expect("huggingface adapter must exist");
+    let hf = registry
+        .get_adapter("huggingface")
+        .expect("huggingface adapter must exist");
     assert_eq!(hf.source_name(), "huggingface");
 
     // Lookup Ollama adapter
-    let ollama = registry.get_adapter("ollama").expect("ollama adapter must exist");
+    let ollama = registry
+        .get_adapter("ollama")
+        .expect("ollama adapter must exist");
     assert_eq!(ollama.source_name(), "ollama");
 
     // Register LocalFileAdapter
@@ -398,7 +436,9 @@ fn test_source_adapter_registry_and_providers() {
     let local = Arc::new(LocalFileAdapter::new(test_dir.path()));
     registry.register(local);
 
-    let local_lookup = registry.get_adapter("local").expect("local adapter must exist");
+    let local_lookup = registry
+        .get_adapter("local")
+        .expect("local adapter must exist");
     assert_eq!(local_lookup.source_name(), "local");
 
     // Unknown source returns None
@@ -431,7 +471,10 @@ fn test_progress_reporting_during_pull() {
         assert!(progress.bytes_downloaded > 0);
         progress_count += 1;
     }
-    assert!(progress_count > 0, "must receive at least one progress update");
+    assert!(
+        progress_count > 0,
+        "must receive at least one progress update"
+    );
 }
 
 #[test]

@@ -420,21 +420,27 @@ fn test_who_uses_concurrent_with_active_gc_sweep() {
     let (s_a, mut f_a) = store_arc.create_staging_file().unwrap();
     f_a.write_all(payload_a).unwrap();
     drop(f_a);
-    let path_a = store_arc.promote_staged_blob(&s_a, &digest_a, "raw").unwrap();
+    let path_a = store_arc
+        .promote_staged_blob(&s_a, &digest_a, "raw")
+        .unwrap();
 
     let payload_b = b"GC_CONCURRENT_SWEEP_PAYLOAD_B";
     let digest_b = Sha256::digest(payload_b);
     let (s_b, mut f_b) = store_arc.create_staging_file().unwrap();
     f_b.write_all(payload_b).unwrap();
     drop(f_b);
-    let path_b = store_arc.promote_staged_blob(&s_b, &digest_b, "raw").unwrap();
+    let path_b = store_arc
+        .promote_staged_blob(&s_b, &digest_b, "raw")
+        .unwrap();
 
     let payload_c = b"GC_CONCURRENT_SWEEP_PAYLOAD_C";
     let digest_c = Sha256::digest(payload_c);
     let (s_c, mut f_c) = store_arc.create_staging_file().unwrap();
     f_c.write_all(payload_c).unwrap();
     drop(f_c);
-    let path_c = store_arc.promote_staged_blob(&s_c, &digest_c, "raw").unwrap();
+    let path_c = store_arc
+        .promote_staged_blob(&s_c, &digest_c, "raw")
+        .unwrap();
 
     // Reset catalog ref_counts to 0 so all 3 are GC candidates
     for dig in [&digest_a, &digest_b, &digest_c] {
@@ -466,7 +472,8 @@ fn test_who_uses_concurrent_with_active_gc_sweep() {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let mut reader_handles = Vec::new();
 
-    let missing_digest = "6666666666666666666666666666666666666666666666666666666666666666".to_string();
+    let missing_digest =
+        "6666666666666666666666666666666666666666666666666666666666666666".to_string();
 
     for thread_id in 0..4 {
         let gc_c = gc_arc.clone();
@@ -583,7 +590,10 @@ fn test_who_uses_when_blob_path_is_directory() {
 
     // who_uses on a directory should handle it without panicking
     let info_res = gc.who_uses(digest);
-    assert!(info_res.is_ok(), "who_uses on directory handles open gracefully without panic");
+    assert!(
+        info_res.is_ok(),
+        "who_uses on directory handles open gracefully without panic"
+    );
     let info = info_res.unwrap();
     assert_eq!(info.digest, digest);
 }
@@ -639,11 +649,19 @@ fn test_who_uses_multiple_referencing_manifests_and_aliases() {
         };
         let man_rec = store.register_manifest(&manifest).unwrap();
         store
-            .create_alias("local", "ns", &format!("model-{i}"), "v1", &man_rec.manifest_digest)
+            .create_alias(
+                "local",
+                "ns",
+                &format!("model-{i}"),
+                "v1",
+                &man_rec.manifest_digest,
+            )
             .unwrap();
     }
 
-    let info = gc.who_uses(&digest).expect("who_uses on multi-referenced blob");
+    let info = gc
+        .who_uses(&digest)
+        .expect("who_uses on multi-referenced blob");
     assert_eq!(info.digest, digest);
     // 3 manifests + 3 aliases = ref_count of 6
     assert_eq!(info.ref_count, 6);
@@ -694,4 +712,3 @@ fn test_who_uses_parallel_probe_stress_under_worker_shared_flock() {
     assert!(!info_after.gate1_shared_lock_held);
     assert!(!info_after.is_in_use());
 }
-

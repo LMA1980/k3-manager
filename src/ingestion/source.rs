@@ -6,7 +6,7 @@
 //! memory writes (`std::ptr::write_volatile`) upon completion.
 
 use std::path::Path;
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{Ordering, compiler_fence};
 
 use crate::ingestion::adapter::{IngestionError, SourceCredentials};
 

@@ -28,14 +28,24 @@ fn print_usage() {
     );
 }
 
-fn open_store(store_root: &Path) -> Result<(ContentAddressedStore, StorageGarbageCollector), String> {
+fn open_store(
+    store_root: &Path,
+) -> Result<(ContentAddressedStore, StorageGarbageCollector), String> {
     let catalog_path = store_root.join("catalog.duckdb");
-    let catalog = DuckDbPersistenceStore::open(&catalog_path)
-        .map_err(|e| format!("failed to open DuckDB catalog at '{}': {e}", catalog_path.display()))?;
+    let catalog = DuckDbPersistenceStore::open(&catalog_path).map_err(|e| {
+        format!(
+            "failed to open DuckDB catalog at '{}': {e}",
+            catalog_path.display()
+        )
+    })?;
     let catalog_arc: Arc<dyn CasCatalog> = Arc::new(catalog);
 
-    let store = ContentAddressedStore::open(store_root, catalog_arc)
-        .map_err(|e| format!("failed to open content-addressed store at '{}': {e}", store_root.display()))?;
+    let store = ContentAddressedStore::open(store_root, catalog_arc).map_err(|e| {
+        format!(
+            "failed to open content-addressed store at '{}': {e}",
+            store_root.display()
+        )
+    })?;
     let gc = StorageGarbageCollector::new(Arc::new(store.clone()));
 
     Ok((store, gc))
@@ -49,7 +59,8 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let mut store_root_str = env::var(ENV_STORE_ROOT).unwrap_or_else(|_| DEFAULT_STORE_ROOT.to_owned());
+    let mut store_root_str =
+        env::var(ENV_STORE_ROOT).unwrap_or_else(|_| DEFAULT_STORE_ROOT.to_owned());
     let mut as_json = false;
     let mut dry_run = false;
     let mut cmd = None;
@@ -122,7 +133,10 @@ fn main() -> ExitCode {
                         println!("Blob: {}", info.digest);
                         println!("Path: {}", info.file_path.display());
                         println!("Size: {} bytes", info.size_bytes);
-                        println!("References: {} active ({:?})", info.ref_count, info.referencing_sources);
+                        println!(
+                            "References: {} active ({:?})",
+                            info.ref_count, info.referencing_sources
+                        );
                         println!(
                             "Gate 1 (flock): {}",
                             if info.gate1_shared_lock_held {
@@ -158,42 +172,37 @@ fn main() -> ExitCode {
                 }
             }
         }
-        "gc" => {
-            match gc.run_gc(dry_run) {
-                Ok(report) => {
-                    if as_json {
-                        if let Ok(json) = serde_json::to_string_pretty(&report) {
-                            println!("{json}");
-                        }
-                    } else {
-                        println!(
-                            "Garbage Collection Sweep (dry_run: {})",
-                            report.dry_run
-                        );
-                        println!("Candidates examined: {}", report.examined_candidates);
-                        println!("Blobs reclaimed: {}", report.reclaimed_blobs.len());
-                        println!("Bytes reclaimed: {} bytes", report.reclaimed_bytes);
-                        if !report.skipped_in_use_gate1.is_empty() {
-                            println!(
-                                "Skipped (Gate 1 flock held): {:?}",
-                                report.skipped_in_use_gate1
-                            );
-                        }
-                        if !report.skipped_mapped_gate2.is_empty() {
-                            println!(
-                                "Skipped (Gate 2 actively mapped): {:?}",
-                                report.skipped_mapped_gate2
-                            );
-                        }
+        "gc" => match gc.run_gc(dry_run) {
+            Ok(report) => {
+                if as_json {
+                    if let Ok(json) = serde_json::to_string_pretty(&report) {
+                        println!("{json}");
                     }
-                    ExitCode::SUCCESS
+                } else {
+                    println!("Garbage Collection Sweep (dry_run: {})", report.dry_run);
+                    println!("Candidates examined: {}", report.examined_candidates);
+                    println!("Blobs reclaimed: {}", report.reclaimed_blobs.len());
+                    println!("Bytes reclaimed: {} bytes", report.reclaimed_bytes);
+                    if !report.skipped_in_use_gate1.is_empty() {
+                        println!(
+                            "Skipped (Gate 1 flock held): {:?}",
+                            report.skipped_in_use_gate1
+                        );
+                    }
+                    if !report.skipped_mapped_gate2.is_empty() {
+                        println!(
+                            "Skipped (Gate 2 actively mapped): {:?}",
+                            report.skipped_mapped_gate2
+                        );
+                    }
                 }
-                Err(err) => {
-                    eprintln!("Error executing garbage collection: {err}");
-                    ExitCode::from(1)
-                }
+                ExitCode::SUCCESS
             }
-        }
+            Err(err) => {
+                eprintln!("Error executing garbage collection: {err}");
+                ExitCode::from(1)
+            }
+        },
         "list" => {
             let filter = cmd_arg.as_deref().unwrap_or("all");
             match filter {
@@ -222,7 +231,10 @@ fn main() -> ExitCode {
                         for m in manifests {
                             println!(
                                 "  {} (arch: {}, quant: {}) -> weights: {}",
-                                m.manifest_digest, m.architecture_id, m.quantization, m.weight_digest
+                                m.manifest_digest,
+                                m.architecture_id,
+                                m.quantization,
+                                m.weight_digest
                             );
                         }
                     }
@@ -249,7 +261,10 @@ fn main() -> ExitCode {
                     }
                     println!("Physical Blobs: {}", blobs.len());
                     for b in blobs {
-                        println!("  - {} ({} bytes, refs: {})", b.digest, b.size_bytes, b.ref_count);
+                        println!(
+                            "  - {} ({} bytes, refs: {})",
+                            b.digest, b.size_bytes, b.ref_count
+                        );
                     }
                 }
             }

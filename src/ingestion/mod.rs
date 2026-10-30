@@ -9,13 +9,9 @@ pub mod provider;
 pub mod staging;
 
 pub use adapter::{
-    AuthStatus, IngestionError, ModelFormat, ModelRevision, ModelVersionListing, PullArtifactSummary,
-    PullProgress, PullRequest, RemoteModelSummary, SearchFilter, SourceAdapter, SourceCredentials,
-    StagingDownload,
+    AuthStatus, IngestionError, ModelFormat, ModelRevision, ModelVersionListing,
+    PullArtifactSummary, PullProgress, PullRequest, RemoteModelSummary, SearchFilter,
+    SourceAdapter, SourceCredentials, StagingDownload,
 };
-pub use provider::{
-    HuggingFaceAdapter, LocalFileAdapter, OllamaAdapter, SourceAdapterRegistry,
-};
-pub use staging::{
-    GgufHeaderPrefix, SafeTensorsHeaderPrefix, StagingPipeline,
-};
+pub use provider::{HuggingFaceAdapter, LocalFileAdapter, OllamaAdapter, SourceAdapterRegistry};
+pub use staging::{GgufHeaderPrefix, SafeTensorsHeaderPrefix, StagingPipeline};

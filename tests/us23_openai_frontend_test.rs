@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use k3_core::affinity::ControlPlaneCapacityConfig;
 use k3_core::profile::{
-    ComputePool, CONSERVATIVE_TUNING_ADVISORY, ModelListResponse, PriorityClass, TuningProfile,
+    CONSERVATIVE_TUNING_ADVISORY, ComputePool, ModelListResponse, PriorityClass, TuningProfile,
 };
 use k3_manager::domain::{MockOsAffinityBackend, OsAffinityBackend};
 use k3_manager::protocol::{
@@ -161,10 +161,7 @@ async fn test_us23_chat_completions_non_streaming_json() {
     assert_eq!(completion.object, "chat.completion");
     assert_eq!(completion.model, "qwen2.5-7b");
     assert_eq!(completion.choices.len(), 1);
-    assert_eq!(
-        completion.choices[0].finish_reason.as_deref(),
-        Some("stop")
-    );
+    assert_eq!(completion.choices[0].finish_reason.as_deref(), Some("stop"));
     assert!(completion.choices[0].message.content.is_some());
     assert!(completion.usage.prompt_tokens > 0);
     assert!(completion.usage.completion_tokens > 0);
@@ -368,8 +365,7 @@ async fn test_us23_context_length_exceeded_returns_400_without_silent_truncation
         .expect("apply constrained tuning profile");
 
     // Construct oversized prompt with 25 words (> 10 tokens)
-    let long_prompt =
-        "The quick brown fox jumps over the lazy dog repeatedly until the context length is completely saturated and breached by the user.";
+    let long_prompt = "The quick brown fox jumps over the lazy dog repeatedly until the context length is completely saturated and breached by the user.";
     let req = OpenAiChatRequest {
         model: "constrained-model".to_owned(),
         messages: vec![OpenAiMessage::user(long_prompt)],

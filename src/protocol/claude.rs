@@ -15,16 +15,15 @@
     clippy::too_many_lines
 )]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use k3_core::error::K3Error;
 
 use crate::protocol::types::{
     ClaudeContent, ClaudeContentBlock, ClaudeErrorDetails, ClaudeErrorResponse,
-    ClaudeMessageRequest, ClaudeMessageResponse, ClaudeUsage, HttpRequest,
-    HttpResponse,
+    ClaudeMessageRequest, ClaudeMessageResponse, ClaudeUsage, HttpRequest, HttpResponse,
 };
 use crate::runtime::ControlPlaneRuntime;
 
@@ -129,9 +128,11 @@ impl ClaudeAdapter {
             if let Some(prev) = prev_role {
                 if prev == msg.role {
                     let msg_text = if prev == "user" {
-                        "Invalid message sequence: consecutive user messages are not permitted".to_owned()
+                        "Invalid message sequence: consecutive user messages are not permitted"
+                            .to_owned()
                     } else {
-                        "Invalid message sequence: consecutive assistant messages are not permitted".to_owned()
+                        "Invalid message sequence: consecutive assistant messages are not permitted"
+                            .to_owned()
                     };
                     let err = ClaudeErrorResponse {
                         r#type: "error".to_owned(),
@@ -167,7 +168,12 @@ impl ClaudeAdapter {
         let canonical_prompt = Self::translate_to_canonical_prompt(&req);
 
         // 4. Tokenization & Context Window Admission Bounds check (ADR-027, US-24 Scenario 3)
-        let token_count = match runtime.dispatch_tokenize_prompt(&req.model, &canonical_prompt, true, n_ctx) {
+        let token_count = match runtime.dispatch_tokenize_prompt(
+            &req.model,
+            &canonical_prompt,
+            true,
+            n_ctx,
+        ) {
             Ok(tokens) => tokens.len(),
             Err(e) => {
                 let is_overflow = format!("{e}").contains("context_length_exceeded");
@@ -494,7 +500,9 @@ impl ClaudeAdapter {
                     ))
                     .await;
 
-                runtime_clone.queue_mgr().mark_execution_completed(&model_name);
+                runtime_clone
+                    .queue_mgr()
+                    .mark_execution_completed(&model_name);
             });
 
             HttpResponse::sse_stream(sse_rx)
@@ -694,7 +702,10 @@ impl ClaudeAdapter {
                             }
                             "tool_use" => {
                                 prompt.push_str("<tool_call>\n");
-                                let json_input = b.input.as_ref().map_or_else(|| "{}".to_owned(), |v| v.to_string());
+                                let json_input = b
+                                    .input
+                                    .as_ref()
+                                    .map_or_else(|| "{}".to_owned(), |v| v.to_string());
                                 prompt.push_str(&json_input);
                                 prompt.push_str("\n</tool_call>");
                             }
@@ -808,7 +819,10 @@ impl ClaudeAdapter {
         let mut map = serde_json::Map::new();
 
         if let Some(params) = schema {
-            if let Some(props) = params.get("properties").and_then(serde_json::Value::as_object) {
+            if let Some(props) = params
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
                 for (prop_name, prop_schema) in props {
                     let prop_type = prop_schema
                         .get("type")

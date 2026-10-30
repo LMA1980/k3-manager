@@ -96,32 +96,66 @@ async fn test_challenge_multiple_question_mark_delimiters() {
     // 1. GET /v1/models??extra=1?foo=2 on ProtocolServer
     let req = HttpRequest::new("GET", "/v1/models??extra=1?foo=2", Vec::new());
     let resp = server.route_request(req).await;
-    assert_eq!(resp.status, 200, "ProtocolServer should accept /v1/models??extra=1?foo=2");
+    assert_eq!(
+        resp.status, 200,
+        "ProtocolServer should accept /v1/models??extra=1?foo=2"
+    );
 
     // 2. GET /v1/models??extra=1?foo=2 on OpenAiAdapter::handle_http
     let req = HttpRequest::new("GET", "/v1/models??extra=1?foo=2", Vec::new());
     let resp = OpenAiAdapter::handle_http(req, Arc::clone(&runtime)).await;
-    assert_eq!(resp.status, 200, "OpenAiAdapter should accept /v1/models??extra=1?foo=2");
+    assert_eq!(
+        resp.status, 200,
+        "OpenAiAdapter should accept /v1/models??extra=1?foo=2"
+    );
 
     // 3. POST /v1/chat/completions??extra=1?foo=2 on ProtocolServer
-    let req = HttpRequest::new("POST", "/v1/chat/completions??extra=1?foo=2", openai_body.clone().into_bytes());
+    let req = HttpRequest::new(
+        "POST",
+        "/v1/chat/completions??extra=1?foo=2",
+        openai_body.clone().into_bytes(),
+    );
     let resp = server.route_request(req).await;
-    assert_eq!(resp.status, 200, "ProtocolServer should accept /v1/chat/completions??extra=1?foo=2");
+    assert_eq!(
+        resp.status, 200,
+        "ProtocolServer should accept /v1/chat/completions??extra=1?foo=2"
+    );
 
     // 4. POST /v1/chat/completions??extra=1?foo=2 on OpenAiAdapter::handle_http
-    let req = HttpRequest::new("POST", "/v1/chat/completions??extra=1?foo=2", openai_body.into_bytes());
+    let req = HttpRequest::new(
+        "POST",
+        "/v1/chat/completions??extra=1?foo=2",
+        openai_body.into_bytes(),
+    );
     let resp = OpenAiAdapter::handle_http(req, Arc::clone(&runtime)).await;
-    assert_eq!(resp.status, 200, "OpenAiAdapter should accept /v1/chat/completions??extra=1?foo=2");
+    assert_eq!(
+        resp.status, 200,
+        "OpenAiAdapter should accept /v1/chat/completions??extra=1?foo=2"
+    );
 
     // 5. POST /v1/messages??extra=1?foo=2 on ProtocolServer
-    let req = HttpRequest::new("POST", "/v1/messages??extra=1?foo=2", claude_body.clone().into_bytes());
+    let req = HttpRequest::new(
+        "POST",
+        "/v1/messages??extra=1?foo=2",
+        claude_body.clone().into_bytes(),
+    );
     let resp = server.route_request(req).await;
-    assert_eq!(resp.status, 200, "ProtocolServer should accept /v1/messages??extra=1?foo=2");
+    assert_eq!(
+        resp.status, 200,
+        "ProtocolServer should accept /v1/messages??extra=1?foo=2"
+    );
 
     // 6. POST /v1/messages??extra=1?foo=2 on ClaudeAdapter::handle_http
-    let req = HttpRequest::new("POST", "/v1/messages??extra=1?foo=2", claude_body.into_bytes());
+    let req = HttpRequest::new(
+        "POST",
+        "/v1/messages??extra=1?foo=2",
+        claude_body.into_bytes(),
+    );
     let resp = ClaudeAdapter::handle_http(req, Arc::clone(&runtime)).await;
-    assert_eq!(resp.status, 200, "ClaudeAdapter should accept /v1/messages??extra=1?foo=2");
+    assert_eq!(
+        resp.status, 200,
+        "ClaudeAdapter should accept /v1/messages??extra=1?foo=2"
+    );
 }
 
 // ============================================================================
@@ -162,22 +196,42 @@ async fn test_challenge_empty_query_strings() {
     assert_eq!(resp.status, 200, "OpenAiAdapter should accept /v1/models?");
 
     // 2. Chat completions routes with empty '?'
-    let req = HttpRequest::new("POST", "/v1/chat/completions?", openai_body.clone().into_bytes());
+    let req = HttpRequest::new(
+        "POST",
+        "/v1/chat/completions?",
+        openai_body.clone().into_bytes(),
+    );
     let resp = server.route_request(req).await;
-    assert_eq!(resp.status, 200, "ProtocolServer should accept /v1/chat/completions?");
+    assert_eq!(
+        resp.status, 200,
+        "ProtocolServer should accept /v1/chat/completions?"
+    );
 
-    let req = HttpRequest::new("POST", "/chat/completions?", openai_body.clone().into_bytes());
+    let req = HttpRequest::new(
+        "POST",
+        "/chat/completions?",
+        openai_body.clone().into_bytes(),
+    );
     let resp = server.route_request(req).await;
-    assert_eq!(resp.status, 200, "ProtocolServer should accept /chat/completions?");
+    assert_eq!(
+        resp.status, 200,
+        "ProtocolServer should accept /chat/completions?"
+    );
 
     let req = HttpRequest::new("POST", "/v1/chat/completions?", openai_body.into_bytes());
     let resp = OpenAiAdapter::handle_http(req, Arc::clone(&runtime)).await;
-    assert_eq!(resp.status, 200, "OpenAiAdapter should accept /v1/chat/completions?");
+    assert_eq!(
+        resp.status, 200,
+        "OpenAiAdapter should accept /v1/chat/completions?"
+    );
 
     // 3. Messages routes with empty '?'
     let req = HttpRequest::new("POST", "/v1/messages?", claude_body.clone().into_bytes());
     let resp = server.route_request(req).await;
-    assert_eq!(resp.status, 200, "ProtocolServer should accept /v1/messages?");
+    assert_eq!(
+        resp.status, 200,
+        "ProtocolServer should accept /v1/messages?"
+    );
 
     let req = HttpRequest::new("POST", "/messages?", claude_body.clone().into_bytes());
     let resp = server.route_request(req).await;
@@ -185,7 +239,10 @@ async fn test_challenge_empty_query_strings() {
 
     let req = HttpRequest::new("POST", "/v1/messages?", claude_body.into_bytes());
     let resp = ClaudeAdapter::handle_http(req, Arc::clone(&runtime)).await;
-    assert_eq!(resp.status, 200, "ClaudeAdapter should accept /v1/messages?");
+    assert_eq!(
+        resp.status, 200,
+        "ClaudeAdapter should accept /v1/messages?"
+    );
 }
 
 // ============================================================================
@@ -203,27 +260,42 @@ async fn test_challenge_non_get_requests_on_models_return_404() {
         // ProtocolServer /v1/models
         let req = HttpRequest::new(method, "/v1/models", Vec::new());
         let resp = server.route_request(req).await;
-        assert_eq!(resp.status, 404, "ProtocolServer {method} /v1/models must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ProtocolServer {method} /v1/models must return 404"
+        );
 
         // ProtocolServer /models
         let req = HttpRequest::new(method, "/models", Vec::new());
         let resp = server.route_request(req).await;
-        assert_eq!(resp.status, 404, "ProtocolServer {method} /models must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ProtocolServer {method} /models must return 404"
+        );
 
         // ProtocolServer with query params
         let req = HttpRequest::new(method, "/v1/models?limit=10", Vec::new());
         let resp = server.route_request(req).await;
-        assert_eq!(resp.status, 404, "ProtocolServer {method} /v1/models?limit=10 must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ProtocolServer {method} /v1/models?limit=10 must return 404"
+        );
 
         // OpenAiAdapter direct /v1/models
         let req = HttpRequest::new(method, "/v1/models", Vec::new());
         let resp = OpenAiAdapter::handle_http(req, Arc::clone(&runtime)).await;
-        assert_eq!(resp.status, 404, "OpenAiAdapter {method} /v1/models must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "OpenAiAdapter {method} /v1/models must return 404"
+        );
 
         // OpenAiAdapter direct /models
         let req = HttpRequest::new(method, "/models", Vec::new());
         let resp = OpenAiAdapter::handle_http(req, Arc::clone(&runtime)).await;
-        assert_eq!(resp.status, 404, "OpenAiAdapter {method} /models must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "OpenAiAdapter {method} /models must return 404"
+        );
     }
 }
 
@@ -242,30 +314,48 @@ async fn test_challenge_non_post_requests_on_chat_and_messages_return_404() {
         // Chat endpoints on ProtocolServer
         let req = HttpRequest::new(method, "/v1/chat/completions", Vec::new());
         let resp = server.route_request(req).await;
-        assert_eq!(resp.status, 404, "ProtocolServer {method} /v1/chat/completions must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ProtocolServer {method} /v1/chat/completions must return 404"
+        );
 
         let req = HttpRequest::new(method, "/chat/completions", Vec::new());
         let resp = server.route_request(req).await;
-        assert_eq!(resp.status, 404, "ProtocolServer {method} /chat/completions must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ProtocolServer {method} /chat/completions must return 404"
+        );
 
         // Chat endpoints on OpenAiAdapter
         let req = HttpRequest::new(method, "/v1/chat/completions", Vec::new());
         let resp = OpenAiAdapter::handle_http(req, Arc::clone(&runtime)).await;
-        assert_eq!(resp.status, 404, "OpenAiAdapter {method} /v1/chat/completions must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "OpenAiAdapter {method} /v1/chat/completions must return 404"
+        );
 
         // Messages endpoints on ProtocolServer
         let req = HttpRequest::new(method, "/v1/messages", Vec::new());
         let resp = server.route_request(req).await;
-        assert_eq!(resp.status, 404, "ProtocolServer {method} /v1/messages must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ProtocolServer {method} /v1/messages must return 404"
+        );
 
         let req = HttpRequest::new(method, "/messages", Vec::new());
         let resp = server.route_request(req).await;
-        assert_eq!(resp.status, 404, "ProtocolServer {method} /messages must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ProtocolServer {method} /messages must return 404"
+        );
 
         // Messages endpoints on ClaudeAdapter
         let req = HttpRequest::new(method, "/v1/messages", Vec::new());
         let resp = ClaudeAdapter::handle_http(req, Arc::clone(&runtime)).await;
-        assert_eq!(resp.status, 404, "ClaudeAdapter {method} /v1/messages must return 404");
+        assert_eq!(
+            resp.status, 404,
+            "ClaudeAdapter {method} /v1/messages must return 404"
+        );
     }
 }
 
@@ -367,20 +457,30 @@ async fn test_challenge_saturated_queue_and_client_disconnect_permit_teardown() 
     let resp = server.route_request(req).await;
     assert_eq!(resp.status, 429, "Saturated queue must return HTTP 429");
 
-    let retry_after = resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Retry-After"));
-    assert!(retry_after.is_some(), "Retry-After header must be present on 429");
-    let secs: u64 = retry_after.unwrap().1.parse().expect("valid integer Retry-After");
+    let retry_after = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Retry-After"));
+    assert!(
+        retry_after.is_some(),
+        "Retry-After header must be present on 429"
+    );
+    let secs: u64 = retry_after
+        .unwrap()
+        .1
+        .parse()
+        .expect("valid integer Retry-After");
     assert!(secs > 0, "Retry-After seconds must be > 0");
 
     // Clear the pre-occupied slot so the streaming request is admitted
-    runtime.queue_mgr().mark_execution_completed("saturation-test-model");
+    runtime
+        .queue_mgr()
+        .mark_execution_completed("saturation-test-model");
 
     // Client disconnect permit teardown test
     let (mut client, server_stream) = tokio::io::duplex(4096);
     let srv = ProtocolServer::new(ProtocolServerConfig::default(), Arc::clone(&runtime));
-    let server_handle = tokio::spawn(async move {
-        srv.handle_connection(server_stream).await
-    });
+    let server_handle = tokio::spawn(async move { srv.handle_connection(server_stream).await });
 
     let chat_req = serde_json::json!({
         "model": "saturation-test-model",

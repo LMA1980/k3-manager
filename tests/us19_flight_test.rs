@@ -171,7 +171,10 @@ fn test_flight_receiver_direct_population_and_finalize() {
     // Verify descriptor liveness via fcntl(F_GETFD)
     // SAFETY: Querying descriptor flags via fcntl does not mutate state or cause undefined behavior.
     let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
-    assert!(flags >= 0, "returned RawFd must be active and valid in the kernel (not EBADF)");
+    assert!(
+        flags >= 0,
+        "returned RawFd must be active and valid in the kernel (not EBADF)"
+    );
 
     // Safely close descriptor at end of test
     // SAFETY: raw_fd was verified open and is exclusively owned by this test.
@@ -186,13 +189,17 @@ fn test_memfd_scm_rights_uds_transfer() {
 
     // 1. Create and populate memfd arena on sender side
     let mut arena = MemfdArena::new("sender_tensor_arena", 16 * 1024).unwrap();
-    arena.write_at(0, b"TRANSMITTED_VIA_SCM_RIGHTS_PAYLOAD").unwrap();
+    arena
+        .write_at(0, b"TRANSMITTED_VIA_SCM_RIGHTS_PAYLOAD")
+        .unwrap();
     arena.seal_write().unwrap();
     assert!(arena.is_sealed());
 
     // 2. Transfer sealed FD over UDS via SCM_RIGHTS
     let model_id = "qwen2.5-7b-transferred";
-    arena.transfer_via_uds(&sock_sender, model_id.as_bytes()).unwrap();
+    arena
+        .transfer_via_uds(&sock_sender, model_id.as_bytes())
+        .unwrap();
 
     // 3. Receive sealed FD on receiver side
     let (payload, received_fd) = MemfdArena::receive_from_uds(&sock_receiver).unwrap();

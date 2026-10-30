@@ -22,8 +22,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use k3_core::K3Error;
@@ -32,9 +32,9 @@ use k3_manager::ingestion::{
 };
 use k3_manager::persistence::{CasCatalog, DuckDbPersistenceStore};
 use k3_manager::store::{
-    parse_alias_id, validate_path_component, validate_sha256_digest, ContentAddressedStore,
-    DerivedBlobManager, DerivedResolution, MockProcMapsScanner, ProcessMappingInfo,
-    ProcessMapsScanner, RetentionPolicy, Sha256, StorageGarbageCollector,
+    ContentAddressedStore, DerivedBlobManager, DerivedResolution, MockProcMapsScanner,
+    ProcessMappingInfo, ProcessMapsScanner, RetentionPolicy, Sha256, StorageGarbageCollector,
+    parse_alias_id, validate_path_component, validate_sha256_digest,
 };
 
 static CHALLENGER1_SEQ: AtomicU64 = AtomicU64::new(20_000);
@@ -167,14 +167,14 @@ fn test_challenge_f25_path_traversal_null_bytes_and_symlink_escapes() {
 
     // Aliases with traversal or bad components
     let bad_aliases = [
-        "huggingface/Qwen/Qwen2.5-7B",             // only 3 segments
-        "huggingface/Qwen/Qwen2.5-7B/v1/extra",    // 5 segments
-        "huggingface/Qwen/Qwen2.5-7B/v1/",         // trailing slash
-        "/huggingface/Qwen/Qwen2.5-7B/v1",         // leading slash
-        "huggingface/../model/v1",                 // traversal in namespace
-        "huggingface/Qwen/../../v1",               // traversal in model
-        "huggingface/Qwen/model/\0v1",             // null byte
-        "models/huggingface/Qwen/Qwen2.5-7B",      // 3 segments with prefix
+        "huggingface/Qwen/Qwen2.5-7B",          // only 3 segments
+        "huggingface/Qwen/Qwen2.5-7B/v1/extra", // 5 segments
+        "huggingface/Qwen/Qwen2.5-7B/v1/",      // trailing slash
+        "/huggingface/Qwen/Qwen2.5-7B/v1",      // leading slash
+        "huggingface/../model/v1",              // traversal in namespace
+        "huggingface/Qwen/../../v1",            // traversal in model
+        "huggingface/Qwen/model/\0v1",          // null byte
+        "models/huggingface/Qwen/Qwen2.5-7B",   // 3 segments with prefix
     ];
 
     for alias in bad_aliases {
@@ -433,8 +433,14 @@ fn test_challenge_f26_macos_var_symlink_handling_in_mock_scanner_and_who_uses() 
     assert_eq!(res_raw[0].pid, 1234);
 
     // Query with canonical path (/private/var/... on macOS)
-    let res_canon = mock_scanner.scan_mappings_for_path(&canonical_blob_path).unwrap();
-    assert_eq!(res_canon.len(), 1, "Mapping must be found when queried via canonical path");
+    let res_canon = mock_scanner
+        .scan_mappings_for_path(&canonical_blob_path)
+        .unwrap();
+    assert_eq!(
+        res_canon.len(),
+        1,
+        "Mapping must be found when queried via canonical path"
+    );
     assert_eq!(res_canon[0].pid, 1234);
 
     let test_scanner = Arc::new(MockProcMapsScanner::new());
@@ -473,10 +479,16 @@ fn test_challenge_f26_macos_var_symlink_handling_in_mock_scanner_and_who_uses() 
     // Call who_uses for a non-existent digest
     let non_existent_digest = "0000000000000000000000000000000000000000000000000000000000000000";
     let res_missing = gc.who_uses(non_existent_digest);
-    assert!(res_missing.is_err(), "who_uses on non-existent digest must return error");
+    assert!(
+        res_missing.is_err(),
+        "who_uses on non-existent digest must return error"
+    );
     let err = res_missing.unwrap_err();
     match err {
-        K3Error::CapabilityMismatch { architecture, reason } => {
+        K3Error::CapabilityMismatch {
+            architecture,
+            reason,
+        } => {
             assert_eq!(architecture, "cas_gc");
             assert!(
                 reason.contains("not found in store"),
@@ -512,10 +524,11 @@ fn test_challenge_f27_safetensors_header_length_boundary_attacks() {
         drop(f);
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject header_len == 0");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("invalid SafeTensors header length"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("invalid SafeTensors header length")
+        );
     }
 
     // 3. header_len > 100MB ceiling (100 * 1024 * 1024 + 1)
@@ -526,17 +539,18 @@ fn test_challenge_f27_safetensors_header_length_boundary_attacks() {
         drop(f);
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject header_len > 100MB");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("invalid SafeTensors header length"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("invalid SafeTensors header length")
+        );
     }
 
     // 4. header_len + 8 > file_len (truncated JSON header)
     {
         let (staging, mut f) = store.create_staging_file().unwrap();
         f.write_all(&1000u64.to_le_bytes()).unwrap(); // claims 1000 bytes
-        f.write_all(b"{\"small\":1}").unwrap();        // only 11 bytes
+        f.write_all(b"{\"small\":1}").unwrap(); // only 11 bytes
         drop(f);
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject truncated header");
@@ -562,10 +576,11 @@ fn test_challenge_f27_safetensors_header_length_boundary_attacks() {
 
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject inverted data_offsets");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("inverted data_offsets"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("inverted data_offsets")
+        );
     }
 
     // 6. Tensor data_offsets extending past file length (8 + header_len + end > file_len)
@@ -587,10 +602,7 @@ fn test_challenge_f27_safetensors_header_length_boundary_attacks() {
 
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject offsets exceeding file length");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds file length"));
+        assert!(res.unwrap_err().to_string().contains("exceeds file length"));
     }
 
     // 7. Tensor offset integer overflow (end = u64::MAX)
@@ -633,7 +645,10 @@ fn test_challenge_f27_safetensors_header_length_boundary_attacks() {
         drop(f);
 
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
-        assert!(res.is_ok(), "Valid boundary SafeTensors must succeed: {res:?}");
+        assert!(
+            res.is_ok(),
+            "Valid boundary SafeTensors must succeed: {res:?}"
+        );
     }
 }
 
@@ -675,7 +690,11 @@ fn test_challenge_f27_gguf_count_bounds_and_24byte_mock_format() {
         drop(f);
         let res = ContentAddressedStore::verify_format_header(&staging, "gguf");
         assert!(res.is_err(), "Must reject unsupported GGUF version {v}");
-        assert!(res.unwrap_err().to_string().contains("unsupported GGUF version"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("unsupported GGUF version")
+        );
     }
 
     for v in [1u32, 2u32, 3u32] {
@@ -740,7 +759,8 @@ fn test_challenge_f27_gguf_count_bounds_and_24byte_mock_format() {
     // 6. Authentic 24-byte mock GGUF format:
     // Magic (4B) + Version 2 (4B) + tensor_count 0 (8B) + kv_count 0 (8B)
     {
-        let mock_header = b"GGUF\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let mock_header =
+            b"GGUF\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
         assert_eq!(mock_header.len(), 24);
 
         let (staging, mut f) = store.create_staging_file().unwrap();
@@ -748,12 +768,18 @@ fn test_challenge_f27_gguf_count_bounds_and_24byte_mock_format() {
         drop(f);
 
         let res = ContentAddressedStore::verify_format_header(&staging, "gguf");
-        assert!(res.is_ok(), "24-byte mock GGUF must pass header verification");
+        assert!(
+            res.is_ok(),
+            "24-byte mock GGUF must pass header verification"
+        );
 
         // Verify it can be promoted into CAS
         let digest = Sha256::digest(mock_header);
         let promoted = store.promote_staged_blob(&staging, &digest, "gguf");
-        assert!(promoted.is_ok(), "Promotion of 24-byte mock GGUF must succeed");
+        assert!(
+            promoted.is_ok(),
+            "Promotion of 24-byte mock GGUF must succeed"
+        );
     }
 }
 
@@ -780,7 +806,10 @@ fn test_challenge_derived_layout_nonexistent_source_blob_error_reporting() {
     assert!(res.is_err(), "Must error on non-existent source blob");
     let err = res.unwrap_err();
     match err {
-        K3Error::CapabilityMismatch { architecture, reason } => {
+        K3Error::CapabilityMismatch {
+            architecture,
+            reason,
+        } => {
             assert_eq!(architecture, "derived_weights");
             assert!(
                 reason.contains("not found in store; cannot derive layout"),
@@ -827,14 +856,19 @@ fn test_challenge_derived_layout_nonexistent_source_blob_error_reporting() {
                 architecture: "test".into(),
                 reason: e.to_string(),
             })?;
-            out.write_all(b"DERIVED_IME_TILED_WEIGHTS").map_err(|e| K3Error::CapabilityMismatch {
-                architecture: "test".into(),
-                reason: e.to_string(),
+            out.write_all(b"DERIVED_IME_TILED_WEIGHTS").map_err(|e| {
+                K3Error::CapabilityMismatch {
+                    architecture: "test".into(),
+                    reason: e.to_string(),
+                }
             })?;
             Ok(25)
         },
     );
-    assert!(conv_res.is_ok(), "Conversion with existing source blob must succeed");
+    assert!(
+        conv_res.is_ok(),
+        "Conversion with existing source blob must succeed"
+    );
     let res_enum = conv_res.unwrap();
     assert!(matches!(res_enum, DerivedResolution::Created { .. }));
 
@@ -847,5 +881,8 @@ fn test_challenge_derived_layout_nonexistent_source_blob_error_reporting() {
         |_src, _dst| panic!("Converter must not be invoked on cached derived layout"),
     );
     assert!(cached_res.is_ok());
-    assert!(matches!(cached_res.unwrap(), DerivedResolution::Cached { .. }));
+    assert!(matches!(
+        cached_res.unwrap(),
+        DerivedResolution::Cached { .. }
+    ));
 }

@@ -17,8 +17,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use k3_manager::ingestion::{
@@ -26,8 +26,8 @@ use k3_manager::ingestion::{
 };
 use k3_manager::persistence::{CasCatalog, DuckDbPersistenceStore};
 use k3_manager::store::{
-    parse_alias_id, validate_path_component, validate_sha256_digest, ContentAddressedStore,
-    ProcessMappingInfo, ProcessMapsScanner, Sha256, StorageGarbageCollector,
+    ContentAddressedStore, ProcessMappingInfo, ProcessMapsScanner, Sha256, StorageGarbageCollector,
+    parse_alias_id, validate_path_component, validate_sha256_digest,
 };
 
 static CHALLENGE_SEQ: AtomicU64 = AtomicU64::new(10_000);
@@ -430,10 +430,11 @@ fn challenge_f27_safetensors_header_boundary_attacks() {
         drop(f);
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject header_len == 0");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("invalid SafeTensors header length"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("invalid SafeTensors header length")
+        );
     }
 
     // Attack 3: header_len > 100MB ceiling (100MB + 1 byte)
@@ -444,10 +445,11 @@ fn challenge_f27_safetensors_header_boundary_attacks() {
         drop(f);
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject header_len > 100MB");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("invalid SafeTensors header length"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("invalid SafeTensors header length")
+        );
     }
 
     // Attack 4: header_len + 8 > file_len (claim 50 bytes JSON, but only 10 provided)
@@ -509,10 +511,11 @@ fn challenge_f27_safetensors_header_boundary_attacks() {
 
         let res = ContentAddressedStore::verify_format_header(&staging, "safetensors");
         assert!(res.is_err(), "Must reject inverted data_offsets");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("inverted data_offsets"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("inverted data_offsets")
+        );
     }
 
     // Attack 7: Valid SafeTensors exactly on boundary (8 + header_len + end == file_len)
@@ -579,10 +582,11 @@ fn challenge_f27_gguf_count_and_magic_boundary_attacks() {
         drop(f);
         let res = ContentAddressedStore::verify_format_header(&staging, "gguf");
         assert!(res.is_err(), "Must reject unsupported version 99");
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported GGUF version"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("unsupported GGUF version")
+        );
     }
 
     // Attack 4: tensor_count boundary: 65536 vs 65537

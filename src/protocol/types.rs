@@ -90,7 +90,10 @@ impl HttpResponse {
         Self {
             status,
             headers: vec![
-                ("Content-Type".to_owned(), "application/json; charset=utf-8".to_owned()),
+                (
+                    "Content-Type".to_owned(),
+                    "application/json; charset=utf-8".to_owned(),
+                ),
                 ("Content-Length".to_owned(), json_body.len().to_string()),
             ],
             body: HttpResponseBody::Bytes(json_body.into_bytes()),
@@ -103,7 +106,10 @@ impl HttpResponse {
         Self {
             status: 200,
             headers: vec![
-                ("Content-Type".to_owned(), "text/event-stream; charset=utf-8".to_owned()),
+                (
+                    "Content-Type".to_owned(),
+                    "text/event-stream; charset=utf-8".to_owned(),
+                ),
                 ("Cache-Control".to_owned(), "no-cache".to_owned()),
                 ("Connection".to_owned(), "keep-alive".to_owned()),
             ],
@@ -115,7 +121,10 @@ impl HttpResponse {
     #[must_use]
     pub fn error(status: u16, json_body: String, extra_headers: Vec<(String, String)>) -> Self {
         let mut headers = vec![
-            ("Content-Type".to_owned(), "application/json; charset=utf-8".to_owned()),
+            (
+                "Content-Type".to_owned(),
+                "application/json; charset=utf-8".to_owned(),
+            ),
             ("Content-Length".to_owned(), json_body.len().to_string()),
         ];
         headers.extend(extra_headers);
@@ -466,9 +475,11 @@ impl ClaudeSystem {
     pub fn as_text(&self) -> String {
         match self {
             Self::Text(s) => s.clone(),
-            Self::Blocks(blocks) => {
-                blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n\n")
-            }
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
         }
     }
 }

@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use k3_core::K3Error;
 use k3_manager::persistence::{CasCatalog, DuckDbPersistenceStore};
 use k3_manager::store::{
-    ContentAddressedStore, DerivedBlobManager, DerivedResolution, RetentionPolicy,
-    Sha256, StaleRecipeOutcome, check_derived_memory_admission,
+    ContentAddressedStore, DerivedBlobManager, DerivedResolution, RetentionPolicy, Sha256,
+    StaleRecipeOutcome, check_derived_memory_admission,
 };
 
 static GLOBAL_SEQ: AtomicU64 = AtomicU64::new(100);
@@ -44,14 +44,20 @@ impl Drop for TestTempDir {
     }
 }
 
-fn create_store_with_source_blob(source_content: &[u8]) -> (Arc<ContentAddressedStore>, DerivedBlobManager, String, TestTempDir) {
+fn create_store_with_source_blob(
+    source_content: &[u8],
+) -> (
+    Arc<ContentAddressedStore>,
+    DerivedBlobManager,
+    String,
+    TestTempDir,
+) {
     let temp_dir = TestTempDir::new("k3_test_us21");
     let catalog = DuckDbPersistenceStore::open_in_memory().expect("open catalog");
     let catalog_arc: Arc<dyn CasCatalog> = Arc::new(catalog);
 
     let store = Arc::new(
-        ContentAddressedStore::open(temp_dir.path(), catalog_arc.clone())
-            .expect("open store"),
+        ContentAddressedStore::open(temp_dir.path(), catalog_arc.clone()).expect("open store"),
     );
     let manager = DerivedBlobManager::new(store.clone());
 
@@ -130,7 +136,10 @@ fn test_scenario1_reuse_cached_derived_layout_across_loads() {
         )
         .expect("second load reuses cached layout");
 
-    assert!(!second_conversion_ran, "converter was not run on second load");
+    assert!(
+        !second_conversion_ran,
+        "converter was not run on second load"
+    );
     match resolution2 {
         DerivedResolution::Cached {
             derived_digest,
@@ -175,8 +184,14 @@ fn test_scenario2_operator_controlled_retention_policies() {
 
         // Original source weights still exist
         assert!(store.blobs_dir().join(&source_digest).exists());
-        let purge_flag = store.catalog().get_storage_config(&format!("purge_immediate:{source_digest}")).unwrap();
-        assert!(purge_flag.is_none(), "Keep policy must not mark for immediate purge");
+        let purge_flag = store
+            .catalog()
+            .get_storage_config(&format!("purge_immediate:{source_digest}"))
+            .unwrap();
+        assert!(
+            purge_flag.is_none(),
+            "Keep policy must not mark for immediate purge"
+        );
     }
 
     // 2. RetentionPolicy::PurgeImmediate
@@ -269,7 +284,10 @@ fn test_scenario3_stale_recipe_detection_and_auto_rebuild() {
         )
         .expect("handle stale recipe");
 
-    assert!(rebuild_ran, "auto-rebuild must run when source weights are present");
+    assert!(
+        rebuild_ran,
+        "auto-rebuild must run when source weights are present"
+    );
     match outcome_rebuilt {
         StaleRecipeOutcome::Rebuilt {
             new_derived_digest,

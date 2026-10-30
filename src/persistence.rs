@@ -268,29 +268,53 @@ pub trait CasCatalog: fmt::Debug + Send + Sync {
 
     // Manifest lifecycle
     fn save_manifest(&self, manifest: &ModelManifestRecord) -> Result<(), PersistenceError>;
-    fn get_manifest(&self, manifest_digest: &str) -> Result<Option<ModelManifestRecord>, PersistenceError>;
+    fn get_manifest(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<ModelManifestRecord>, PersistenceError>;
     fn list_manifests(&self) -> Result<Vec<ModelManifestRecord>, PersistenceError>;
     fn delete_manifest(&self, manifest_digest: &str) -> Result<bool, PersistenceError>;
 
     // Alias hierarchy
     fn save_alias(&self, alias: &ModelAliasRecord) -> Result<(), PersistenceError>;
     fn get_alias(&self, alias_id: &str) -> Result<Option<ModelAliasRecord>, PersistenceError>;
-    fn find_alias(&self, source: &str, namespace: &str, name: &str, tag: &str) -> Result<Option<ModelAliasRecord>, PersistenceError>;
+    fn find_alias(
+        &self,
+        source: &str,
+        namespace: &str,
+        name: &str,
+        tag: &str,
+    ) -> Result<Option<ModelAliasRecord>, PersistenceError>;
     fn list_aliases(&self) -> Result<Vec<ModelAliasRecord>, PersistenceError>;
     fn delete_alias(&self, alias_id: &str) -> Result<bool, PersistenceError>;
 
     // Derived layouts
     fn save_derived_blob(&self, derived: &DerivedBlobRecord) -> Result<(), PersistenceError>;
-    fn get_derived_blob(&self, source_digest: &str, recipe_version: &str, target_layout: &str) -> Result<Option<DerivedBlobRecord>, PersistenceError>;
+    fn get_derived_blob(
+        &self,
+        source_digest: &str,
+        recipe_version: &str,
+        target_layout: &str,
+    ) -> Result<Option<DerivedBlobRecord>, PersistenceError>;
     fn list_derived_blobs(&self) -> Result<Vec<DerivedBlobRecord>, PersistenceError>;
-    fn list_derived_for_source(&self, source_digest: &str) -> Result<Vec<DerivedBlobRecord>, PersistenceError>;
-    fn update_derived_status(&self, derived_digest: &str, status: &str) -> Result<(), PersistenceError>;
+    fn list_derived_for_source(
+        &self,
+        source_digest: &str,
+    ) -> Result<Vec<DerivedBlobRecord>, PersistenceError>;
+    fn update_derived_status(
+        &self,
+        derived_digest: &str,
+        status: &str,
+    ) -> Result<(), PersistenceError>;
     fn delete_derived_blob(&self, derived_digest: &str) -> Result<bool, PersistenceError>;
 
     // References
     fn add_blob_reference(&self, reference: &BlobReferenceRecord) -> Result<(), PersistenceError>;
     fn remove_blob_reference(&self, ref_id: &str) -> Result<bool, PersistenceError>;
-    fn list_blob_references(&self, blob_digest: &str) -> Result<Vec<BlobReferenceRecord>, PersistenceError>;
+    fn list_blob_references(
+        &self,
+        blob_digest: &str,
+    ) -> Result<Vec<BlobReferenceRecord>, PersistenceError>;
 
     // Storage config & watermarks
     fn get_storage_config(&self, key: &str) -> Result<Option<String>, PersistenceError>;
@@ -1005,12 +1029,18 @@ impl CasCatalog for DuckDbPersistenceStore {
             .conn
             .lock()
             .map_err(|e| PersistenceError::LockError(e.to_string()))?;
-        let _ = conn.execute("DELETE FROM blob_references WHERE blob_digest = ?1;", params![digest]);
+        let _ = conn.execute(
+            "DELETE FROM blob_references WHERE blob_digest = ?1;",
+            params![digest],
+        );
         let _ = conn.execute(
             "DELETE FROM storage_config WHERE config_key = 'purge_immediate:' || ?1 OR config_key = 'purge_after:' || ?1;",
             params![digest],
         );
-        let affected = conn.execute("DELETE FROM model_blobs WHERE digest = ?1;", params![digest])?;
+        let affected = conn.execute(
+            "DELETE FROM model_blobs WHERE digest = ?1;",
+            params![digest],
+        )?;
         Ok(affected > 0)
     }
 
@@ -1088,7 +1118,10 @@ impl CasCatalog for DuckDbPersistenceStore {
         Ok(())
     }
 
-    fn get_manifest(&self, manifest_digest: &str) -> Result<Option<ModelManifestRecord>, PersistenceError> {
+    fn get_manifest(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<ModelManifestRecord>, PersistenceError> {
         let conn = self
             .conn
             .lock()
@@ -1228,7 +1261,13 @@ impl CasCatalog for DuckDbPersistenceStore {
         Ok(res)
     }
 
-    fn find_alias(&self, source: &str, namespace: &str, name: &str, tag: &str) -> Result<Option<ModelAliasRecord>, PersistenceError> {
+    fn find_alias(
+        &self,
+        source: &str,
+        namespace: &str,
+        name: &str,
+        tag: &str,
+    ) -> Result<Option<ModelAliasRecord>, PersistenceError> {
         let conn = self
             .conn
             .lock()
@@ -1291,7 +1330,10 @@ impl CasCatalog for DuckDbPersistenceStore {
             .conn
             .lock()
             .map_err(|e| PersistenceError::LockError(e.to_string()))?;
-        let affected = conn.execute("DELETE FROM model_aliases WHERE alias_id = ?1;", params![alias_id])?;
+        let affected = conn.execute(
+            "DELETE FROM model_aliases WHERE alias_id = ?1;",
+            params![alias_id],
+        )?;
         Ok(affected > 0)
     }
 
@@ -1338,16 +1380,19 @@ impl CasCatalog for DuckDbPersistenceStore {
              WHERE source_digest = ?1 AND recipe_version = ?2 AND target_layout = ?3;",
         )?;
         let res = stmt
-            .query_row(params![source_digest, recipe_version, target_layout], |row| {
-                Ok(DerivedBlobRecord {
-                    derived_digest: row.get(0)?,
-                    source_digest: row.get(1)?,
-                    recipe_version: row.get(2)?,
-                    target_layout: row.get(3)?,
-                    status: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })
+            .query_row(
+                params![source_digest, recipe_version, target_layout],
+                |row| {
+                    Ok(DerivedBlobRecord {
+                        derived_digest: row.get(0)?,
+                        source_digest: row.get(1)?,
+                        recipe_version: row.get(2)?,
+                        target_layout: row.get(3)?,
+                        status: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
             .optional()?;
         Ok(res)
     }
@@ -1378,7 +1423,10 @@ impl CasCatalog for DuckDbPersistenceStore {
         Ok(list)
     }
 
-    fn list_derived_for_source(&self, source_digest: &str) -> Result<Vec<DerivedBlobRecord>, PersistenceError> {
+    fn list_derived_for_source(
+        &self,
+        source_digest: &str,
+    ) -> Result<Vec<DerivedBlobRecord>, PersistenceError> {
         let conn = self
             .conn
             .lock()
@@ -1404,7 +1452,11 @@ impl CasCatalog for DuckDbPersistenceStore {
         Ok(list)
     }
 
-    fn update_derived_status(&self, derived_digest: &str, status: &str) -> Result<(), PersistenceError> {
+    fn update_derived_status(
+        &self,
+        derived_digest: &str,
+        status: &str,
+    ) -> Result<(), PersistenceError> {
         let conn = self
             .conn
             .lock()
@@ -1470,7 +1522,10 @@ impl CasCatalog for DuckDbPersistenceStore {
                 |r| r.get(0),
             )
             .optional()?;
-        let affected = conn.execute("DELETE FROM blob_references WHERE ref_id = ?1;", params![ref_id])?;
+        let affected = conn.execute(
+            "DELETE FROM blob_references WHERE ref_id = ?1;",
+            params![ref_id],
+        )?;
         if let Some(digest) = blob_opt {
             conn.execute(
                 "UPDATE model_blobs SET ref_count = (
@@ -1482,7 +1537,10 @@ impl CasCatalog for DuckDbPersistenceStore {
         Ok(affected > 0)
     }
 
-    fn list_blob_references(&self, blob_digest: &str) -> Result<Vec<BlobReferenceRecord>, PersistenceError> {
+    fn list_blob_references(
+        &self,
+        blob_digest: &str,
+    ) -> Result<Vec<BlobReferenceRecord>, PersistenceError> {
         let conn = self
             .conn
             .lock()
@@ -1512,9 +1570,8 @@ impl CasCatalog for DuckDbPersistenceStore {
             .conn
             .lock()
             .map_err(|e| PersistenceError::LockError(e.to_string()))?;
-        let mut stmt = conn.prepare(
-            "SELECT config_value FROM storage_config WHERE config_key = ?1;",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT config_value FROM storage_config WHERE config_key = ?1;")?;
         let res = stmt.query_row(params![key], |row| row.get(0)).optional()?;
         Ok(res)
     }
@@ -1611,9 +1668,12 @@ impl CasCatalog for DuckDbPersistenceStore {
             .lock()
             .map_err(|e| PersistenceError::LockError(e.to_string()))?;
         let sum_opt: Option<i64> = conn
-            .query_row("SELECT CAST(COALESCE(SUM(size_bytes), 0) AS BIGINT) FROM model_blobs;", [], |r| r.get(0))
+            .query_row(
+                "SELECT CAST(COALESCE(SUM(size_bytes), 0) AS BIGINT) FROM model_blobs;",
+                [],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(sum_opt.map_or(0, |v| u64::try_from(v.max(0)).unwrap_or(0)))
     }
 }
-

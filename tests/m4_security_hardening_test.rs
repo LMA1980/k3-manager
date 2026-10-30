@@ -22,12 +22,12 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use k3_core::profile::TuningProfile;
 use k3_core::K3Error;
+use k3_core::profile::TuningProfile;
 use k3_manager::ingestion::provider::resolve_secret_value;
 use k3_manager::ingestion::{
     IngestionError, LocalFileAdapter, PullRequest, SourceAdapter, SourceCredentials,
@@ -40,8 +40,8 @@ use k3_manager::persistence::{
 use k3_manager::protocol::ProtocolServerConfig;
 use k3_manager::queue::AdmissionQueueManager;
 use k3_manager::store::{
-    validate_sha256_digest, ContentAddressedStore, MockProcMapsScanner, ModelManifest,
-    ProcessMappingInfo, Sha256, StorageGarbageCollector,
+    ContentAddressedStore, MockProcMapsScanner, ModelManifest, ProcessMappingInfo, Sha256,
+    StorageGarbageCollector, validate_sha256_digest,
 };
 
 static TEST_SEQ: AtomicU64 = AtomicU64::new(500);
@@ -143,35 +143,37 @@ fn test_feature25_manifest_weight_digest_traversal_rejected() {
 #[test]
 fn test_feature25_validate_sha256_digest_strictness() {
     // Uppercase hex must fail
-    assert!(validate_sha256_digest(
-        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855")
+            .is_err()
+    );
     // Leading/trailing whitespace must fail
-    assert!(validate_sha256_digest(
-        " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 "
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest(
+            " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 "
+        )
+        .is_err()
+    );
     // 63 chars (too short)
-    assert!(validate_sha256_digest(
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85")
+            .is_err()
+    );
     // 65 chars (too long)
-    assert!(validate_sha256_digest(
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855a"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855a")
+            .is_err()
+    );
     // Illegal characters
-    assert!(validate_sha256_digest(
-        "g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    )
-    .is_err());
+    assert!(
+        validate_sha256_digest("g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .is_err()
+    );
     // Valid 64 lowercase hex
-    assert!(validate_sha256_digest(
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    )
-    .is_ok());
+    assert!(
+        validate_sha256_digest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .is_ok()
+    );
 }
 
 #[test]
@@ -445,9 +447,10 @@ fn test_feature27_safetensors_header_ceiling_rejected() {
         "verify_format_header must reject SafeTensors header > 100MB"
     );
     let err = res.unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("invalid SafeTensors header length"));
+    assert!(
+        err.to_string()
+            .contains("invalid SafeTensors header length")
+    );
 }
 
 #[test]

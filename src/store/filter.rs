@@ -321,18 +321,21 @@ impl CapabilityFilter {
         let key = format!("{architecture_id}@{recipe_version}");
         let registry = BUILTIN_RECIPES.read().unwrap();
 
-        let desc = registry.get(&key).ok_or_else(|| K3Error::CapabilityMismatch {
-            architecture: architecture_id.to_owned(),
-            reason: format!(
-                "cannot align tokenizer for unsupported recipe '{}' (supported: {:?})",
-                key,
-                Self::supported_recipes()
-            ),
-        })?;
+        let desc = registry
+            .get(&key)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: architecture_id.to_owned(),
+                reason: format!(
+                    "cannot align tokenizer for unsupported recipe '{}' (supported: {:?})",
+                    key,
+                    Self::supported_recipes()
+                ),
+            })?;
 
-        let chat_template = desc.default_chat_template.clone().unwrap_or_else(|| {
-            ChatTemplate::new(Some("User: {{prompt}}\nAssistant: ".to_owned()))
-        });
+        let chat_template = desc
+            .default_chat_template
+            .clone()
+            .unwrap_or_else(|| ChatTemplate::new(Some("User: {{prompt}}\nAssistant: ".to_owned())));
 
         let special_tokens = desc.special_tokens.clone().unwrap_or_default();
 

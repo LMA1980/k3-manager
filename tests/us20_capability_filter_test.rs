@@ -6,9 +6,7 @@
 //! - Scenario 3: Guaranteed alignment between tokenization and execution recipe.
 
 use k3_core::K3Error;
-use k3_manager::store::{
-    CapabilityFilter, ModelManifest,
-};
+use k3_manager::store::{CapabilityFilter, ModelManifest};
 use k3_tokenizer::SimpleTokenizer;
 
 #[test]
@@ -23,13 +21,17 @@ fn test_scenario1_capability_filtering_during_model_search() {
         context_length: 2048,
         license: Some("Apache-2.0".to_owned()),
         origin: Some("https://huggingface.co/synthetic/model".to_owned()),
-        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_owned(),
         weight_size_bytes: 1024,
         created_at: 1000,
     };
 
     let suitability1 = CapabilityFilter::evaluate_candidate(&supported_candidate);
-    assert!(suitability1.executable, "supported candidate must be flagged executable");
+    assert!(
+        suitability1.executable,
+        "supported candidate must be flagged executable"
+    );
     assert!(suitability1.quantization_supported);
     assert!(suitability1.reason.is_none());
 
@@ -43,15 +45,25 @@ fn test_scenario1_capability_filtering_during_model_search() {
         context_length: 2048,
         license: None,
         origin: None,
-        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_owned(),
         weight_size_bytes: 1024,
         created_at: 1000,
     };
 
     let suitability2 = CapabilityFilter::evaluate_candidate(&unsupported_quant_candidate);
-    assert!(!suitability2.executable, "candidate with unsupported quant must be non-executable");
+    assert!(
+        !suitability2.executable,
+        "candidate with unsupported quant must be non-executable"
+    );
     assert!(!suitability2.quantization_supported);
-    assert!(suitability2.reason.as_ref().unwrap().contains("quantization format 'Q8_0' is not supported"));
+    assert!(
+        suitability2
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("quantization format 'Q8_0' is not supported")
+    );
 
     // 3. Candidate with uncompiled minor revision (e.g., qwen3.8)
     let uncompiled_arch_candidate = ModelManifest {
@@ -63,14 +75,24 @@ fn test_scenario1_capability_filtering_during_model_search() {
         context_length: 2048,
         license: None,
         origin: None,
-        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_owned(),
         weight_size_bytes: 1024,
         created_at: 1000,
     };
 
     let suitability3 = CapabilityFilter::evaluate_candidate(&uncompiled_arch_candidate);
-    assert!(!suitability3.executable, "uncompiled arch candidate must be non-executable");
-    assert!(suitability3.reason.as_ref().unwrap().contains("architecture 'qwen3.8' with recipe version '1.0.0' is not compiled"));
+    assert!(
+        !suitability3.executable,
+        "uncompiled arch candidate must be non-executable"
+    );
+    assert!(
+        suitability3
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("architecture 'qwen3.8' with recipe version '1.0.0' is not compiled")
+    );
 }
 
 #[test]
@@ -85,7 +107,8 @@ fn test_scenario2_upfront_rejection_of_unsupported_revisions() {
         context_length: 2048,
         license: None,
         origin: None,
-        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_owned(),
         weight_size_bytes: 1024,
         created_at: 1000,
     };
@@ -94,7 +117,10 @@ fn test_scenario2_upfront_rejection_of_unsupported_revisions() {
         .expect_err("qwen3.8 must be rejected upfront");
     assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
     assert_eq!(err.diagnostic_code(), "capability_mismatch");
-    assert!(err.to_string().contains("architecture 'qwen3.8' (recipe version '1.0.0') is not compiled"));
+    assert!(
+        err.to_string()
+            .contains("architecture 'qwen3.8' (recipe version '1.0.0') is not compiled")
+    );
 
     // 2. Attempting to validate supported architecture with mismatched recipe version (e.g. qwen3 @ 2.0.0)
     let mismatched_version_manifest = ModelManifest {
@@ -106,7 +132,8 @@ fn test_scenario2_upfront_rejection_of_unsupported_revisions() {
         context_length: 2048,
         license: None,
         origin: None,
-        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_owned(),
         weight_size_bytes: 1024,
         created_at: 1000,
     };
@@ -114,7 +141,10 @@ fn test_scenario2_upfront_rejection_of_unsupported_revisions() {
     let err2 = CapabilityFilter::validate_model_manifest(&mismatched_version_manifest)
         .expect_err("mismatched recipe version must be rejected upfront");
     assert!(matches!(err2, K3Error::CapabilityMismatch { .. }));
-    assert!(err2.to_string().contains("architecture 'qwen3' (recipe version '2.0.0') is not compiled"));
+    assert!(
+        err2.to_string()
+            .contains("architecture 'qwen3' (recipe version '2.0.0') is not compiled")
+    );
 
     // 3. Supported architecture & version succeeds upfront
     let valid_manifest = ModelManifest {
@@ -126,7 +156,8 @@ fn test_scenario2_upfront_rejection_of_unsupported_revisions() {
         context_length: 2048,
         license: None,
         origin: None,
-        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        weight_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_owned(),
         weight_size_bytes: 1024,
         created_at: 1000,
     };
@@ -146,8 +177,14 @@ fn test_scenario3_guaranteed_alignment_between_tokenization_and_recipe() {
     assert_eq!(aligned_env.recipe_version, "1.0.0");
 
     // Verify stop token detection adheres strictly to Qwen3 recipe definition
-    assert!(aligned_env.is_stop_token(151_643), "<|endoftext|> is stop token");
-    assert!(aligned_env.is_stop_token(151_645), "<|im_end|> is stop token");
+    assert!(
+        aligned_env.is_stop_token(151_643),
+        "<|endoftext|> is stop token"
+    );
+    assert!(
+        aligned_env.is_stop_token(151_645),
+        "<|im_end|> is stop token"
+    );
     assert!(!aligned_env.is_stop_token(100), "normal token is not stop");
 
     // 2. Chat template formatting adheres strictly to Qwen3 template
