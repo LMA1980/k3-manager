@@ -339,7 +339,11 @@ impl ModelAdmissionQueue {
 
     /// Marks the current execution pass completed.
     pub fn mark_execution_completed(&mut self) {
-        self.is_executing = false;
+        if self.is_executing {
+            self.is_executing = false;
+        } else {
+            self.queue.pop_front();
+        }
     }
 
     /// Broadcasts advancing queue positions to all queued streaming requests.

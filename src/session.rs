@@ -285,7 +285,7 @@ impl SessionRegistry {
     /// Reconnects a client with optional `last_acked_token_idx` (None returns all tokens).
     ///
     /// # Errors
-    /// Same as [`reconnect_client`].
+    /// Same as `reconnect_client`.
     pub fn reconnect_client_opt(
         &self,
         session_id: &str,
@@ -299,7 +299,7 @@ impl SessionRegistry {
     /// If the retention window has expired, the session is automatically pruned from memory.
     ///
     /// # Errors
-    /// Same as [`reconnect_client`].
+    /// Same as `reconnect_client`.
     pub fn reconnect_client_at(
         &self,
         session_id: &str,
